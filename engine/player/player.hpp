@@ -277,6 +277,7 @@ struct player_t : public actor_t
   timespan_t off_gcd_ready;
   timespan_t cast_while_casting_ready;
   bool in_combat;
+  unsigned in_boss_encounter;
   bool action_queued;
   bool first_cast;
   action_t* last_foreground_action;
@@ -294,6 +295,7 @@ struct player_t : public actor_t
   std::vector<std::pair<player_t*, std::function<void( player_t* )>>> callbacks_on_demise;
   std::vector<std::pair<player_t*, std::function<void( void )>>> callbacks_on_arise;
   std::vector<std::function<void( player_t* )>> callbacks_on_kill;
+  std::vector<std::function<void( player_t*, bool )>> callbacks_on_combat_state;
 
   // Action Priority List
   auto_dispose< std::vector<action_t*> > action_list;
@@ -334,20 +336,21 @@ struct player_t : public actor_t
   std::string tmi_debug_file_str;
   double tmi_window;
 
-  auto_dispose< std::vector<buff_t*> > buff_list;
-  auto_dispose< std::vector<proc_t*> > proc_list;
-  auto_dispose< std::vector<gain_t*> > gain_list;
-  auto_dispose< std::vector<stats_t*> > stats_list;
-  auto_dispose< std::vector<benefit_t*> > benefit_list;
-  auto_dispose< std::vector<uptime_t*> > uptime_list;
-  auto_dispose< std::vector<cooldown_t*> > cooldown_list;
-  auto_dispose< std::vector<target_specific_cooldown_t*> > target_specific_cooldown_list;
-  auto_dispose< std::vector<real_ppm_t*> > rppm_list;
-  auto_dispose< std::vector<shuffled_rng_t*> > shuffled_rng_list;
+  auto_dispose<std::vector<buff_t*>> buff_list;
+  std::vector<std::string> fallback_buff_names;  // buff_t::find( player, name ) will return pointer to sim.auras.fallback
+  auto_dispose<std::vector<proc_t*>> proc_list;
+  auto_dispose<std::vector<gain_t*>> gain_list;
+  auto_dispose<std::vector<stats_t*>> stats_list;
+  auto_dispose<std::vector<benefit_t*>> benefit_list;
+  auto_dispose<std::vector<uptime_t*>> uptime_list;
+  auto_dispose<std::vector<cooldown_t*>> cooldown_list;
+  auto_dispose<std::vector<target_specific_cooldown_t*>> target_specific_cooldown_list;
+  auto_dispose<std::vector<real_ppm_t*>> rppm_list;
+  auto_dispose<std::vector<shuffled_rng_t*>> shuffled_rng_list;
   std::vector<cooldown_t*> dynamic_cooldown_list;
-  std::array< std::vector<plot_data_t>, STAT_MAX > dps_plot_data;
-  std::vector<std::vector<plot_data_t> > reforge_plot_data;
-  auto_dispose< std::vector<sample_data_helper_t*> > sample_data_list;
+  std::array<std::vector<plot_data_t>, STAT_MAX> dps_plot_data;
+  std::vector<std::vector<plot_data_t>> reforge_plot_data;
+  auto_dispose<std::vector<sample_data_helper_t*>> sample_data_list;
   std::vector<std::unique_ptr<cooldown_waste_data_t>> cooldown_waste_data_list;
 
   // All Data collected during / end of combat
@@ -442,6 +445,7 @@ struct player_t : public actor_t
     std::array<buff_t*, 4> ancestral_call;
     buff_t* fireblood;
     buff_t* embrace_of_paku;
+    buff_t* symbol_of_hope; // Priest spell
 
     buff_t* berserking;
     buff_t* bloodlust;
@@ -506,7 +510,7 @@ struct player_t : public actor_t
     buff_t* reckless_force; // The Unbound Force minor - crit chance
     buff_t* reckless_force_counter; // The Unbound Force minor - max 20 stack counter
     stat_buff_t* lifeblood; // Worldvein Resonance - grant primary stat per shard, max 4
-    buff_t* seething_rage; // Blood of the Enemy major - 25% crit dam
+    buff_t* seething_rage_essence; // Blood of the Enemy major - 25% crit dam
     stat_buff_t* reality_shift; // Ripple in Space minor - primary stat on moving 25yds
     buff_t* guardian_of_azeroth; // Condensed Life-Force major - R3 stacking haste on pet cast
 
@@ -575,11 +579,6 @@ struct player_t : public actor_t
     buff_t* heavens_nemesis; // Neltharax, Enemy of the Sky
 
     // 10.1 buffs
-    buff_t* anvil_strike_combat;
-    buff_t* anvil_strike_no_combat;
-
-    // Season 1 Thundering M+ Affix
-    buff_t* mark_of_lightning;
   } buffs;
 
   struct debuffs_t
@@ -607,6 +606,7 @@ struct player_t : public actor_t
     bool focus_magic;
     double blessing_of_summer_duration_multiplier;
     std::vector<timespan_t> power_infusion;
+    std::vector<timespan_t> symbol_of_hope;
     std::vector<timespan_t> blessing_of_summer;
     std::vector<timespan_t> blessing_of_autumn;
     std::vector<timespan_t> blessing_of_winter;
@@ -723,8 +723,27 @@ struct player_t : public actor_t
   /// Current execution type
   execute_type current_execute_type;
 
-
   using resource_callback_function_t = std::function<void()>;
+
+  template <typename T>
+  struct player_option_t
+  {
+    T default_value;
+    T current_value;
+
+    player_option_t( const T val = T() ) : default_value( val ), current_value( val ) {}
+
+    template <typename U = T, typename = std::enable_if_t<std::is_same_v<U, std::string>>>
+    player_option_t( const char* val ) : default_value( val ), current_value( val ) {}
+
+    operator T&() { return current_value; }
+    operator T&() const { return current_value; }
+
+    template <typename U = T, typename = std::enable_if_t<std::is_same_v<U, std::string>>>
+    operator std::string_view() const { return current_value; }
+
+    bool is_default() { return current_value == default_value; }
+  };
 
   struct shadowlands_opt_t
   {
@@ -732,20 +751,40 @@ struct player_t : public actor_t
     /// Buff type: "mastery", "haste", "crit", "versatility"
     /// Overrides sim-wide option with a player-specific one
     /// Empty value indicates use sim-wide option.
-    std::string soleahs_secret_technique_type = "";
+    player_option_t<std::string> soleahs_secret_technique_type;
   } shadowlands_opts;
 
   struct dragonflight_opt_t
   {
     /// Stat to trigger for Gyroscopic Kaleidoscope
     /// Buff type: "mastery", "haste", "crit", "versatility"
-    std::string gyroscopic_kaleidoscope_stat = "haste";
+    player_option_t<std::string> gyroscopic_kaleidoscope_stat = "haste";
     // Ruby Whelp Shell training levels
     // Overrides sim-wide option with a player-specific one
-    std::string ruby_whelp_shell_training = "";
+    player_option_t<std::string> ruby_whelp_shell_training;
     // A list of context-aware procs for Ruby Whelp Shell
     // Overrides sim-wide option with a player-specific one
-    std::string ruby_whelp_shell_context = "";
+    player_option_t<std::string> ruby_whelp_shell_context;
+    // Set the dragonflight for Glimmering Chromatic Orb
+    // Overrides sim-wide option with a player-specific one
+    player_option_t<std::string> ominous_chromatic_essence_dragonflight = "obsidian";
+    // Set the allies dragonflights for Glimmering Chromatic Orb
+    // Overrides sim-wide option with a player-specific one
+    player_option_t<std::string> ominous_chromatic_essence_allies;
+    // Set the target type for Askhandur's Damage Doubling
+    // Overrides sim-wide option with a player-specific one
+    player_option_t<bool> ashkandur_humanoid;
+    // Set the initial starting state for the igneous flowstone trinket Ebb/Flood/High/Low Tides.
+    // Any other input will have it randomly select between High and Low Tide, and this this is default.
+    // Overrides sim-wide option with a player-specific one
+    player_option_t<std::string> flowstone_starting_state = "random_active";
+    /// Type stat given by Spoils of Neltharus on pull
+    /// Buff type: "mastery", "haste", "crit", "vers", other for random
+    player_option_t<std::string> spoils_of_neltharus_initial_type = "";
+    /// Chance for igenous flowstone lave wave to hit twice
+    player_option_t<double> igneous_flowstone_double_lava_wave_chance;
+    /// Enable Voice of the Silent Star's proc
+    player_option_t<bool> voice_of_the_silent_star_enable = true;
   } dragonflight_opts;
 
 private:
@@ -1026,17 +1065,14 @@ public:
   virtual double composite_crit_avoidance() const;
   virtual double composite_attack_power_multiplier() const;
   virtual double composite_spell_power_multiplier() const;
-  virtual double matching_gear_multiplier( attribute_e /* attr */ ) const
-  { return 0; }
-  virtual double composite_player_multiplier   ( school_e ) const;
-  virtual double composite_player_dd_multiplier( school_e,  const action_t* /* a */ = nullptr ) const { return 1; }
-  virtual double composite_player_td_multiplier( school_e,  const action_t* a = nullptr ) const;
+  virtual double matching_gear_multiplier( attribute_e /* attr */ ) const { return 0; }
+  /// Player-wide school based multipliers
+  virtual double composite_player_multiplier( school_e ) const;
   /// Persistent multipliers that are snapshot at the beginning of the spell application/execution
-  virtual double composite_persistent_multiplier( school_e ) const
-  { return 1.0; }
+  virtual double composite_persistent_multiplier( school_e ) const { return 1.0; }
   virtual double composite_player_target_multiplier( player_t* target, school_e school ) const;
   virtual double composite_player_heal_multiplier( const action_state_t* s ) const;
-  virtual double composite_player_dh_multiplier( school_e ) const { return 1; }
+  virtual double composite_player_dh_multiplier( school_e ) const { return 1.0; }
   virtual double composite_player_th_multiplier( school_e ) const;
   virtual double composite_player_absorb_multiplier( const action_state_t* s ) const;
   virtual double composite_player_pet_damage_multiplier( const action_state_t*, bool guardian ) const;
@@ -1114,9 +1150,12 @@ public:
   virtual void schedule_cwc_ready( timespan_t delta_time = timespan_t::min() );
   virtual void arise();
   virtual void demise();
+  virtual void enter_combat();
+  virtual void leave_combat();
   virtual timespan_t available() const;
   virtual action_t* select_action( const action_priority_list_t&, execute_type type = execute_type::FOREGROUND, const action_t* context = nullptr );
   virtual action_t* execute_action();
+
 
   virtual void   regen( timespan_t periodicity = timespan_t::from_seconds( 0.25 ) );
   virtual double resource_gain( resource_e resource_type, double amount, gain_t* source = nullptr,
@@ -1149,6 +1188,7 @@ public:
   virtual void assess_damage_imminent( school_e, result_amount_type, action_state_t* );
   virtual void do_damage( action_state_t* );
   virtual void assess_heal( school_e, result_amount_type, action_state_t* );
+  virtual void trigger_callbacks( proc_types, proc_types2, action_t*, action_state_t* );
 
   virtual bool taunt( player_t* /* source */ ) { return false; }
 
@@ -1312,6 +1352,7 @@ public:
   void register_on_demise_callback( player_t* source, std::function<void( player_t* )> fn );
   void register_on_arise_callback( player_t* source, std::function<void( void )> fn );
   void register_on_kill_callback( std::function<void( player_t* )> fn );
+  void register_on_combat_state_callback( std::function<void( player_t*, bool )> fn );
 
   void update_off_gcd_ready();
   void update_cast_while_casting_ready();

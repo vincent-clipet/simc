@@ -656,12 +656,12 @@ struct judgment_ret_t : public judgment_t
 
     if ( p->talents.boundless_judgment->ok() )
     {
-      holy_power_generation += p->talents.boundless_judgment->effectN( 1 ).base_value();
+      holy_power_generation += as<int>( p->talents.boundless_judgment->effectN( 1 ).base_value() );
     }
 
     if ( p->talents.blessed_champion->ok() )
     {
-      aoe = 1 + p->talents.blessed_champion->effectN( 4 ).base_value();
+      aoe = as<int>( 1 + p->talents.blessed_champion->effectN( 4 ).base_value() );
       base_aoe_multiplier *= 1.0 - p->talents.blessed_champion->effectN( 3 ).percent();
     }
 
@@ -694,7 +694,7 @@ struct judgment_ret_t : public judgment_t
 
     if ( p->talents.boundless_judgment->ok() )
     {
-      holy_power_generation += p->talents.boundless_judgment->effectN( 1 ).base_value();
+      holy_power_generation += as<int>( p->talents.boundless_judgment->effectN( 1 ).base_value() );
     }
 
     // we don't do the blessed champion stuff here; DT judgments do not seem to cleave
@@ -994,7 +994,7 @@ struct adjudication_blessed_hammer_tick_t : public paladin_spell_t
   {
     aoe = -1;
     background = dual = direct_tick = true;
-    callbacks = false;
+    callbacks = true;
     radius = 9.0;
     may_crit = true;
   }
@@ -1054,7 +1054,7 @@ struct base_templar_strike_t : public paladin_melee_attack_t
 
     if ( p->talents.blessed_champion->ok() )
     {
-      aoe = 1 + p->talents.blessed_champion->effectN( 4 ).base_value();
+      aoe = as<int>( 1 + p->talents.blessed_champion->effectN( 4 ).base_value() );
       base_aoe_multiplier *= 1.0 - p->talents.blessed_champion->effectN( 3 ).percent();
     }
 

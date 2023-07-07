@@ -80,6 +80,11 @@ struct purge_the_wicked_t final : public priest_spell_t
     apply_affecting_aura( priest().talents.discipline.revel_in_purity );
     // 8% / 15% damage increase
     apply_affecting_aura( priest().talents.discipline.pain_and_suffering );
+
+    if ( priest().sets->has_set_bonus( PRIEST_DISCIPLINE, T30, B2 ) )
+    {
+      apply_affecting_aura( p.sets->set( PRIEST_DISCIPLINE, T30, B2 ) );
+    }
   }
 };
 
@@ -125,8 +130,8 @@ struct penance_damage_t : public priest_spell_t
   {
     priest_spell_t::impact( s );
     priest_td_t& td = get_td( s->target );
-    td.dots.shadow_word_pain->adjust_duration( dot_extension, true );
-    td.dots.purge_the_wicked->adjust_duration( dot_extension, true );
+    td.dots.shadow_word_pain->adjust_duration( dot_extension );
+    td.dots.purge_the_wicked->adjust_duration( dot_extension );
   }
 };
 
@@ -517,7 +522,7 @@ void priest_t::create_buffs_discipline()
 
   buffs.harsh_discipline = make_buff( this, "harsh_discipline", talents.discipline.harsh_discipline )
                                ->set_max_stack( talents.discipline.harsh_discipline.enabled()
-                                                    ? talents.discipline.harsh_discipline->effectN( 1 ).base_value()
+                                                    ? as<int>(talents.discipline.harsh_discipline->effectN( 1 ).base_value())
                                                     : 999 )
                                ->set_stack_change_callback( [ this ]( buff_t*, int, int ) {
                                  if ( buffs.harsh_discipline->at_max_stacks() )

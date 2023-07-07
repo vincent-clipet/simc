@@ -31,7 +31,7 @@ public:
     // The shard cost reduction from Crashing Chaos is "undone" for Impending Ruin stacking
     // This can be observed during the free Ritual of Ruin cast, which always increments by 1 stack regardless of spell
     // TOCHECK: Does this apply for Rain of Chaos draws?
-    if ( p()->buffs.crashing_chaos->check() )
+    if ( !p()->min_version_check( VERSION_10_1_5 ) && p()->buffs.crashing_chaos->check() )
       shards_used -= as<int>( p()->buffs.crashing_chaos->check_value() );
 
     // Do cost changes reduce number of draws appropriately? This may be difficult to check
@@ -132,6 +132,11 @@ struct internal_combustion_t : public destruction_spell_t
     dot->current_action->calculate_tick_amount( state, 1.0 );
 
     double tick_base_damage = state->result_raw;
+
+    // 2023-04-29 Internal Combustion does not benefit from the Roaring Blaze multiplier only
+    if ( td->debuffs_conflagrate->up() )
+      tick_base_damage /= 1.0 + td->debuffs_conflagrate->check_value();
+
     timespan_t remaining = std::min( dot->remains(), timespan_t::from_seconds( p()->talents.internal_combustion->effectN( 1 ).base_value() ) );
     timespan_t dot_tick_time = dot->current_action->tick_time( state );
     double ticks_left = remaining / dot_tick_time;
@@ -162,7 +167,7 @@ struct shadowburn_t : public destruction_spell_t
   {
     double c = destruction_spell_t::cost();
 
-    if ( c > 0.0 && p()->talents.crashing_chaos->ok() )
+    if ( c > 0.0 && !p()->min_version_check(VERSION_10_1_5) && p()->talents.crashing_chaos->ok() )
       c += p()->buffs.crashing_chaos->check_value();
 
     return c;        
@@ -200,7 +205,8 @@ struct shadowburn_t : public destruction_spell_t
     if ( p()->talents.burn_to_ashes->ok() )
       p()->buffs.burn_to_ashes->trigger( as<int>( p()->talents.burn_to_ashes->effectN( 4 ).base_value() ) );
 
-    p()->buffs.crashing_chaos->decrement();
+    if ( !p()->min_version_check( VERSION_10_1_5 ) )
+      p()->buffs.crashing_chaos->decrement();
   }
 
   double action_multiplier() const override
@@ -708,7 +714,7 @@ struct chaos_bolt_t : public destruction_spell_t
     if ( p()->buffs.ritual_of_ruin->check() )
       c *= 1.0 + p()->talents.ritual_of_ruin_buff->effectN( 2 ).percent();
 
-    if ( c > 0.0 && p()->talents.crashing_chaos->ok() )
+    if ( c > 0.0 && !p()->min_version_check( VERSION_10_1_5 ) && p()->talents.crashing_chaos->ok() )
       c += p()->buffs.crashing_chaos->check_value();
 
     return c;      
@@ -737,6 +743,9 @@ struct chaos_bolt_t : public destruction_spell_t
 
     if ( p()->talents.madness_of_the_azjaqir->ok() )
       m *= 1.0 + p()->buffs.madness_cb->check_value();
+
+    if ( p()->min_version_check( VERSION_10_1_5 ) && p()->buffs.crashing_chaos->check() )
+      m *= 1.0 + p()->talents.crashing_chaos->effectN( 2 ).percent();
 
     return m;
   }
@@ -900,6 +909,16 @@ struct rain_of_fire_t : public destruction_spell_t
         td( s->target )->debuffs_pyrogenics->trigger();
     }
 
+    double composite_persistent_multiplier( const action_state_t* s ) const override
+    {
+      double m = destruction_spell_t::composite_persistent_multiplier( s );
+
+      if ( p()->min_version_check( VERSION_10_1_5 ) && p()->buffs.crashing_chaos->check() )
+        m *= 1.0 + p()->talents.crashing_chaos->effectN( 1 ).percent();
+
+      return m;
+    }
+
     double action_multiplier() const override
     {
       double m = destruction_spell_t::action_multiplier();
@@ -935,7 +954,7 @@ struct rain_of_fire_t : public destruction_spell_t
     if ( p()->buffs.ritual_of_ruin->check() )
       c *= 1.0 + p()->talents.ritual_of_ruin_buff->effectN( 5 ).percent();
     
-    if ( c > 0.0 && p()->talents.crashing_chaos->ok() )
+    if ( c > 0.0 && !p()->min_version_check( VERSION_10_1_5 ) && p()->talents.crashing_chaos->ok() )
       c += p()->buffs.crashing_chaos->check_value();
 
     return c;        
@@ -997,12 +1016,12 @@ struct channel_demonfire_tick_t : public destruction_spell_t
     spell_power_mod.direct = p->talents.channel_demonfire_tick->effectN( 1 ).sp_coeff();
 
     aoe = -1;
-    if ( !( p->min_version_check( VERSION_10_1_0 ) ) )
-      base_multiplier *= 1.0 + p->talents.ruin->effectN( 1 ).percent();
+
     base_aoe_multiplier = p->talents.channel_demonfire_tick->effectN( 2 ).sp_coeff() / p->talents.channel_demonfire_tick->effectN( 1 ).sp_coeff();
+
+    travel_speed = p->talents.channel_demonfire_travel->missile_speed();
   }
 
-  // TOCHECK: As of 2023-04-03, PTR is not canceling/resetting the Umbrafire buff when starting CDF. Presumably this will change before Live
   void impact( action_state_t* s ) override
   {
     destruction_spell_t::impact( s );
@@ -1380,7 +1399,7 @@ struct avatar_of_destruction_t : public destruction_spell_t
 
   infernal_awakening_proc_t* infernal_awakening;
 
-  avatar_of_destruction_t( warlock_t* p ) : destruction_spell_t( "avatar_of_destruction", p, p->talents.avatar_of_destruction )
+  avatar_of_destruction_t( warlock_t* p ) : destruction_spell_t( "avatar_of_destruction", p, p->talents.summon_blasphemy )
   {
     background = dual = true;
     infernal_awakening = new infernal_awakening_proc_t( p );
@@ -1413,11 +1432,19 @@ struct channel_demonfire_tier_t : public destruction_spell_t
 
     aoe = -1;
     base_aoe_multiplier = p->tier.channel_demonfire->effectN( 2 ).sp_coeff() / p->tier.channel_demonfire->effectN( 1 ).sp_coeff();
+
+    travel_speed = p->talents.channel_demonfire_travel->missile_speed();
   }
 
   void impact( action_state_t* s ) override
   {
     destruction_spell_t::impact( s );
+
+    // Raging Demonfire will adjust the time remaining on all targets hit by an AoE pulse
+    if ( p()->talents.raging_demonfire->ok() && td( s->target )->dots_immolate->is_ticking() )
+    {
+      td( s->target )->dots_immolate->adjust_duration( p()->talents.raging_demonfire->effectN( 2 ).time_value() );
+    }
 
     if ( s->chain_target == 0 && p()->sets->has_set_bonus( WARLOCK_DESTRUCTION, T30, B4 ) )
       p()->buffs.umbrafire_embers->trigger();
@@ -1502,10 +1529,20 @@ void warlock_t::create_buffs_destruction()
                          ->set_pct_buff_type( STAT_PCT_BUFF_HASTE )
                          ->set_default_value( talents.flashpoint->effectN( 1 ).percent() );
 
-  buffs.crashing_chaos = make_buff( this, "crashing_chaos", talents.crashing_chaos_buff )
-                             ->set_max_stack( std::max( as<int>( talents.crashing_chaos->effectN( 1 ).base_value() ), 1 ) )
-                             ->set_reverse( true )
-                             ->set_default_value( talents.crashing_chaos_buff->effectN( 1 ).base_value() / 10.0 );
+  if ( min_version_check( VERSION_10_1_5 ) )
+  {
+    buffs.crashing_chaos = make_buff( this, "crashing_chaos", talents.crashing_chaos_buff )
+                               ->set_max_stack( std::max( as<int>( talents.crashing_chaos->effectN( 3 ).base_value() ), 1 ) )
+                               ->set_reverse( true );
+  }
+  else
+  {
+    buffs.crashing_chaos = make_buff( this, "crashing_chaos", talents.crashing_chaos_buff )
+                               ->set_max_stack( std::max( as<int>( talents.crashing_chaos->effectN( 1 ).base_value() ), 1 ) )
+                               ->set_reverse( true )
+                               ->set_default_value( talents.crashing_chaos_buff->effectN( 1 ).base_value() / 10.0 );
+  }
+
 
   buffs.power_overwhelming = make_buff( this, "power_overwhelming", talents.power_overwhelming_buff )
                                  ->set_pct_buff_type( STAT_PCT_BUFF_MASTERY )
@@ -1569,6 +1606,7 @@ void warlock_t::init_spells_destruction()
 
   talents.channel_demonfire = find_talent_spell( talent_tree::SPECIALIZATION, "Channel Demonfire" ); // Should be ID 196447
   talents.channel_demonfire_tick = find_spell( 196448 ); // Includes both direct and splash damage values
+  talents.channel_demonfire_travel = find_spell( 196449 );
 
   talents.pandemonium = find_talent_spell( talent_tree::SPECIALIZATION, "Pandemonium" ); // Should be ID 387509
 
@@ -1625,7 +1663,7 @@ void warlock_t::init_spells_destruction()
   talents.ritual_of_ruin_buff = find_spell( 387157 );
 
   talents.crashing_chaos = find_talent_spell( talent_tree::SPECIALIZATION, "Crashing Chaos" ); // Should be ID 387355
-  talents.crashing_chaos_buff = find_spell( 387356 );
+  talents.crashing_chaos_buff = find_spell( min_version_check( VERSION_10_1_5 ) ? 417282 : 387356 );
 
   talents.infernal_brand = find_talent_spell( talent_tree::SPECIALIZATION, "Infernal Brand" ); // Should be ID 387475
 
@@ -1659,6 +1697,7 @@ void warlock_t::init_spells_destruction()
   talents.rift_chaos_bolt = find_spell( 394246 );
 
   talents.avatar_of_destruction = find_talent_spell( talent_tree::SPECIALIZATION, "Avatar of Destruction" ); // Should be ID 387159
+  talents.summon_blasphemy = find_spell( 387160 );
 
   // Additional Tier Set spell data
 

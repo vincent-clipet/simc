@@ -145,7 +145,7 @@ public:
   simple_sample_data_t benefit_pct, trigger_pct;
   simple_sample_data_t avg_start, avg_refresh, avg_expire;
   simple_sample_data_t avg_overflow_count, avg_overflow_total;
-  simple_sample_data_t uptime_pct;
+  simple_sample_data_with_min_max_t uptime_pct;
   simple_sample_data_with_min_max_t start_intervals, trigger_intervals, duration_lengths;
   std::vector<uptime_simple_t> stack_uptime;
 
@@ -277,6 +277,9 @@ public:
 
   virtual timespan_t refresh_duration( timespan_t new_duration ) const;
   virtual timespan_t tick_time() const;
+
+  timespan_t iteration_uptime() const
+  { return iteration_uptime_sum; }
 
 #if defined(SC_USE_STAT_CACHE)
   virtual void invalidate_cache();

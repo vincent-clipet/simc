@@ -1,5 +1,5 @@
-// 574 talents, wow build 10.1.0.48898
-static std::array<talent_data_t, 574> __ptr_talent_data { {
+// 572 talents, wow build 10.1.5.50232
+static std::array<talent_data_t, 572> __ptr_talent_data { {
   { "Second Wind"                       , 15757, 0x00, 0x0001,   71,   0,   3,   29838,       0,  0 },
   { "Punish"                            , 15759, 0x00, 0x0001,   73,   1,   0,  275334,       0,  0 },
   { "War Machine"                       , 15760, 0x00, 0x0001,   73,   0,   0,  316733,       0,  0 },
@@ -14,7 +14,6 @@ static std::array<talent_data_t, 574> __ptr_talent_data { {
   { "Rule of Law"                       , 17593, 0x00, 0x0002,   65,   2,   3,  214202,       0,  0 },
   { "Divine Purpose"                    , 17597, 0x00, 0x0002,    0,   0,   4,  223817,       0,  0 },
   { "Holy Avenger"                      , 17599, 0x00, 0x0002,    0,   1,   4,  105809,       0,  0 },
-  { "Seraphim"                          , 17601, 0x00, 0x0002,    0,   2,   4,  152262,       0,  0 },
   { "Abundance"                         , 18569, 0x00, 0x0400,  105,   0,   0,  207383,       0,  0 },
   { "Renewal"                           , 18570, 0x00, 0x0400,    0,   1,   1,  108238,       0,  0 },
   { "Wild Charge"                       , 18571, 0x00, 0x0400,    0,   2,   1,  102401,       0,  0 },
@@ -205,7 +204,7 @@ static std::array<talent_data_t, 574> __ptr_talent_data { {
   { "Light Brewing"                     , 22099, 0x00, 0x0200,  268,   0,   2,  325093,       0,  0 },
   { "Refreshing Jade Wind"              , 22101, 0x00, 0x0200,  270,   1,   5,  196725,       0,  0 },
   { "Dance of Chi-Ji"                   , 22102, 0x00, 0x0200,  269,   2,   5,  325201,       0,  0 },
-  { "Exploding Keg"                     , 22103, 0x00, 0x0200,  268,   2,   5,  325153,       0,  0 },
+  { "Press the Advantage"               , 22103, 0x00, 0x0200,  268,   2,   5,  418359,  100780,  0 },
   { "Celestial Flames"                  , 22104, 0x00, 0x0200,  268,   1,   6,  325177,       0,  0 },
   { "Whirling Dragon Punch"             , 22105, 0x00, 0x0200,  269,   1,   6,  152175,       0,  0 },
   { "High Tolerance"                    , 22106, 0x00, 0x0200,  268,   0,   6,  196737,       0,  0 },
@@ -233,7 +232,6 @@ static std::array<talent_data_t, 574> __ptr_talent_data { {
   { "Feral Lunge"                       , 22149, 0x00, 0x0040,  263,   1,   4,  196884,       0,  0 },
   { "Ancestral Vigor"                   , 22152, 0x00, 0x0040,  264,   0,   3,  207401,       0,  0 },
   { "Stormkeeper"                       , 22153, 0x00, 0x0040,  262,   1,   6,  191634,       0,  0 },
-  { "Feral Affinity"                    , 22155, 0x00, 0x0400,  102,   0,   2,  202157,       0,  0 },
   { "Feral Affinity"                    , 22156, 0x00, 0x0400,  104,   1,   2,  202155,       0,  0 },
   { "Guardian Affinity"                 , 22157, 0x00, 0x0400,  102,   1,   2,  197491,       0,  0 },
   { "Guardian Affinity"                 , 22158, 0x00, 0x0400,  103,   1,   2,  217615,       0,  0 },

@@ -111,13 +111,26 @@ struct divine_word_t final : public priest_spell_t
 };
 
 // holy word cast -> Divine Image [Talent] (392988) -> Divine Image [Buff] (405963) -> Divine Image [Summon] (392990) ->
-// Searing Light (196811)
+// Searing Light (196811) procs from Holy Fire, Chastise, Shadow Word: Pain, Shadow Word: Death, and Smite
 struct searing_light_t final : public priest_spell_t
 {
   searing_light_t( priest_t& p ) : priest_spell_t( "searing_light", p, p.talents.holy.divine_image_searing_light )
   {
     background = true;
     may_miss   = false;
+  }
+};
+
+// holy word cast -> Divine Image [Talent] (392988) -> Divine Image [Buff] (405963) -> Divine Image [Summon] (392990) ->
+// Light Eruption (196811) procs from Holy Nova casts
+struct light_eruption_t final : public priest_spell_t
+{
+  light_eruption_t( priest_t& p ) : priest_spell_t( "light_eruption", p, p.talents.holy.divine_image_light_eruption )
+  {
+    background = true;
+    may_miss   = false;
+    aoe        = -1;
+    radius     = 8;  // Base in spell data is incorrect (100yd)
   }
 };
 
@@ -145,7 +158,7 @@ struct burning_vehemence_t final : public priest_spell_t
     may_crit            = false;
     may_miss            = false;
     aoe                 = -1;
-    full_amount_targets = priest().talents.holy.burning_vehemence_damage->effectN( 2 ).percent();
+    full_amount_targets = as<int>( priest().talents.holy.burning_vehemence_damage->effectN( 2 ).base_value() );
     reduced_aoe_targets = priest().talents.holy.burning_vehemence_damage->effectN( 2 ).base_value();
     base_multiplier     = priest().talents.holy.burning_vehemence->effectN( 3 ).percent();
   }
@@ -343,6 +356,66 @@ struct holy_word_chastise_t final : public priest_spell_t
 
 }  // namespace actions::spells
 
+namespace buffs
+{
+symbol_of_hope_t::symbol_of_hope_t( player_t* p )
+  : buff_t( p, "symbol_of_hope", p->find_spell( 64901 ) ), affected_actions_initialized( false )
+{
+  set_cooldown( 0_ms );
+  s_data_reporting = data().effectN( 1 ).trigger();
+
+  set_stack_change_callback( [ this ]( buff_t* /* b */, int /* old */, int new_ ) {
+    if ( !affected_actions_initialized )
+    {
+      affected_actions.clear();
+
+      for ( auto a : player->action_list )
+      {
+        for ( const spelleffect_data_t& effect : data().effectN( 1 ).trigger()->effects() )
+        {
+          if ( a->data().affected_by_label( effect ) || a->data().affected_by_category( effect ) )
+          {
+            auto affected_action = range::find_if(
+                affected_actions,
+                [ a ]( std::pair<action_t*, double> affected_action ) { return a == affected_action.first; } );
+            if ( affected_action == affected_actions.end() )
+            {
+              affected_actions.emplace_back( a, effect.default_value() );
+            }
+          }
+        }
+      }
+
+      affected_actions_initialized = true;
+    }
+
+    update_cooldowns( new_ );
+  } );
+}
+
+void symbol_of_hope_t::update_cooldowns( int new_ )
+{
+  assert( affected_actions_initialized );
+
+  for ( auto a : affected_actions )
+  {
+    double recharge_rate_multiplier = 1.0 / ( 1 + a.second );
+    if ( new_ > 0 )
+    {
+      a.first->dynamic_recharge_rate_multiplier *= recharge_rate_multiplier;
+    }
+    else
+    {
+      a.first->dynamic_recharge_rate_multiplier /= recharge_rate_multiplier;
+    }
+    if ( a.first->cooldown->action == a.first )
+      a.first->cooldown->adjust_recharge_multiplier();
+    if ( a.first->internal_cooldown->action == a.first )
+      a.first->internal_cooldown->adjust_recharge_multiplier();
+  }
+}
+}  // namespace buffs
+
 void priest_t::create_buffs_holy()
 {
   buffs.apotheosis = make_buff( this, "apotheosis", talents.holy.apotheosis );
@@ -411,13 +484,14 @@ void priest_t::init_spells_holy()
   talents.holy.light_of_the_naaru       = ST( "Light of the Naaru" );
   talents.holy.answered_prayers         = ST( "Answered Prayers" );
   // Row 10
-  talents.holy.divine_word                = ST( "Divine Word" );
-  talents.holy.divine_favor_chastise      = find_spell( 372761 );
-  talents.holy.divine_image               = ST( "Divine Image" );
-  talents.holy.divine_image_buff          = find_spell( 405963 );
-  talents.holy.divine_image_summon        = find_spell( 392990 );
-  talents.holy.divine_image_searing_light = find_spell( 196811 );
-  talents.holy.miracle_worker             = ST( "Miracle Worker" );
+  talents.holy.divine_word                 = ST( "Divine Word" );
+  talents.holy.divine_favor_chastise       = find_spell( 372761 );
+  talents.holy.divine_image                = ST( "Divine Image" );
+  talents.holy.divine_image_buff           = find_spell( 405963 );
+  talents.holy.divine_image_summon         = find_spell( 392990 );
+  talents.holy.divine_image_searing_light  = find_spell( 196811 );
+  talents.holy.divine_image_light_eruption = find_spell( 196812 );
+  talents.holy.miracle_worker              = ST( "Miracle Worker" );
 
   // General Spells
   specs.holy_fire = find_specialization_spell( "Holy Fire" );
@@ -459,6 +533,10 @@ action_t* priest_t::create_action_holy( util::string_view name, util::string_vie
   {
     return new searing_light_t( *this );
   }
+  if ( name == "light_eruption" )
+  {
+    return new light_eruption_t( *this );
+  }
 
   return nullptr;
 }
@@ -471,7 +549,8 @@ void priest_t::init_background_actions_holy()
   }
   if ( talents.holy.divine_image.enabled() )
   {
-    background_actions.searing_light = new actions::spells::searing_light_t( *this );
+    background_actions.searing_light  = new actions::spells::searing_light_t( *this );
+    background_actions.light_eruption = new actions::spells::light_eruption_t( *this );
   }
 }
 

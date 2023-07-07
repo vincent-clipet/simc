@@ -480,6 +480,10 @@ class SpecializationEnumGenerator(DataGenerator):
 
             enum_ids[spec_data.class_id][spec_data.index] = { 'id': spec_id, 'name': spec_name }
 
+        # manually add augmentation evoker to live specialization enums
+        if self._options.build.patch_level() < dbc.WowVersion( 10, 1, 5, 49516 ).patch_level():
+            enum_ids[13][2] = { 'id': 1473, 'name': 'EVOKER_AUGMENTATION' }
+
         return enum_ids
 
     def generate(self, enum_ids = None):
@@ -1012,6 +1016,7 @@ class SpellDataGenerator(DataGenerator):
          184559,                    # Spirit Eruption (WoD 6.2 Agi DPS Trinket 3 damage spell)
          184279,                    # Felstorm (WoD 6.2 Agi DPS Trinket 2 damage spell)
          60235,                     # Darkmoon Card: Greatness proc
+         96977, 96978, 96979,       # Restabilizing Matrix buffs
          71556, 71558, 71559, 71560,# Deathbringer's Will procs
          71484, 71485, 71492,
          45428, 45429, 45430,       # Shattered Sun Pendant procs
@@ -1396,15 +1401,38 @@ class SpellDataGenerator(DataGenerator):
          408090, # Idol of Debilitating Arrogance Druid?
          408042, # Idol of Debilitating Arrogance Rogue?
          408087, # Idol of Debilitating Arrogance Priest
-         408815, 408832, 408835, 408836, # Djaruun
+         408126, # Neltharion's Call to Chaos Mage
+         408122, # Neltharion's Call to Chaos Warrior
+         408127, # Neltharion's Call to Chaos Evoker
+         408128, # Neltharion's Call to Chaos Demon Hunter
+         408123, # Neltharion's Call to Chaos Paladin
+         408256, # Neltharion's Call to Dominance Warlock
+         408259, # Neltharion's Call to Dominance Shaman
+         408260, # Neltharion's Call to Dominance Monk
+         408262, # Neltharion's Call to Dominance Hunter
          401303, 401306, 408513, 408533, 408534, 408535, 408536, 408537, 408538, 408539, 408540, 408584, 408578, 410264, 401324, # Elemntium Pocket Anvil
-         408821, 403545, # Djaruun, Pillar of the Elder Flame
+         408815, 408832, 408835, 408836, 408821, 403545, # Djaruun, Pillar of the Elder Flame
          408667, 408671, 408675, 408770, 408682, 408694, # Dragonfire Bomb Dispenser
-         406244, 378758, 407090, # Spore Colony Shoulderguards
+         406244, 378758, 407090, 407092, # Spore Colony Shoulderguards
          407949, 408015, # Tinker: Shadowflame Rockets
          406753, 406764, 406770, # Shadowflame Wreathe
          401513, 405620, 401516, 405613, 402221, 405615, 401521, 405608, 401518, 405612, 401519, 405611, # Glimmering Chromatic orb
          406251, 406254, 406887, # Shadowflame-Tempered Armor Patch
+         407087, # Ever-Decaying Spores
+         400959, # Zaquali Chaos Grapnel
+         402813, 402894, 402896, 402897, 402898, 402903, 407961, 407982, # Igneous Tidestone
+         401428, 401422, # Vessel of Searing Shadow
+         407914, 407913, 407939,  # Might of the Drogbar set
+         # 10.1.5
+         418076, 418527, 418547, 418773, 418774, 418775, 418776, 419591, 418588, 418999, 418605, 419052,  # Mirror of Fractured Tomorrows
+         417356, 417290, 417139, 417069, 417050, 417049, # Prophetic Stonescales
+         417534, 417545, 417792, 417543, # Time-Thief's Gambit
+         417449, 417458, 417456, 417452, # Accelerating Sandglass
+         415284, 415410, # Paracausal Fragment of Thunderfin
+         415006, 415130, 415245, # Paracausal Fragment of Frostmourne
+         414976, 414968, # Paracausal Fragment of Azzinoth
+         414856, 414864, 414858, 414857, 414865, # Paracausal Fragment of Sulfuras
+         414928, 414936, 414951, 414950, # Paracausal Fragment of Doomhammer/Shalamayne
         ),
 
         # Warrior:
@@ -1518,6 +1546,7 @@ class SpellDataGenerator(DataGenerator):
           ( 386875, 2 ), # Bombardment
           ( 164273, 2 ), # Lone Wolf buff
           ( 361736, 5 ), # Coordinated Assault (pet buff)
+          ( 219199, 1 ), # Dire Beast (summon)
         ),
 
         # Rogue:
@@ -1592,6 +1621,8 @@ class SpellDataGenerator(DataGenerator):
             ( 393727, 0 ), ( 393728, 0 ), ( 394879, 0 ), ( 394888, 0 ), # T29 Outlaw Set Bonus Spells
             ( 393729, 0 ), ( 393730, 0 ), # T29 Subtlety Set Bonus Spells
             ( 409604, 0 ), ( 409605, 0 ), # T30 Outlaw Set Bonus Spells
+            ( 409483, 0 ),          # T30 Assassination Set Bonus Spells
+            ( 413890, 0 ),          # Nightstalker background spell
         ),
 
         # Priest:
@@ -1649,6 +1680,7 @@ class SpellDataGenerator(DataGenerator):
             ( 407468, 0 ),          # Mind Spike Insanity Buff
             ( 391232, 0 ),          # Maddening Touch Insanity
             ( 409502, 0 ),          # Priest Shadow Class Set 2-set - Weakening Reality
+            ( 148859, 0 ),          # Shadowy Apparitions Travel Spell
             # Holy Priest
             ( 196809, 5 ),          # Healing Light (Divine Image legendary pet spell)
             ( 196810, 5 ),          # Dazzling Light (Divine Image legendary pet spell)
@@ -1774,6 +1806,7 @@ class SpellDataGenerator(DataGenerator):
           ( 222251, 0 ),                                # Improved Stormbringer damage
           ( 381725, 0 ), ( 298765, 0 ),                 # Mountains Will Fall Earth Shock and Earthquake Overload
           ( 390287, 0 ),                                # Improved Stormbringer damage spell
+          ( 289439, 0 ),                                # Frost Shock Maelstrom generator
         ),
 
         # Mage:
@@ -1826,6 +1859,9 @@ class SpellDataGenerator(DataGenerator):
           ( 383882, 0 ),                            # Sun King's Blessing
           ( 408763, 0 ),                            # Frost T30 2pc
           ( 408673, 0 ), ( 408674, 0 ),             # Fire T30 4pc
+          ( 414381, 0 ),                            # Concentrated Power AE
+          ( 418735, 0 ),                            # Splintering Ray
+          ( 419800, 0 ),                            # Intensifying Flame
         ),
 
         # Warlock:
@@ -1925,6 +1961,7 @@ class SpellDataGenerator(DataGenerator):
           ( 387414, 0 ),    # Madness Shadowburn aura
           ( 405681, 0 ),    # Immutable Hatred Damage Proc
           ( 409890, 0 ),    # T30 - Channel Demonfire
+          ( 417282, 3 ),    # Crashing Chaos Buff 10.1.5
         ),
 
         # Monk:
@@ -1938,6 +1975,7 @@ class SpellDataGenerator(DataGenerator):
           ( 389684, 0 ), # Close to Heart Leech Buff
           ( 389685, 0 ), # Generous Pour Avoidance Buff
           ( 392883, 0 ), # Vivacious Vivification buff
+          ( 414143, 0 ), # Yu'lon's Grace buff
           # Brewmaster
           ( 195630, 1 ), # Brewmaster Mastery Buff
           ( 115129, 1 ), # Expel Harm Damage
@@ -1955,6 +1993,7 @@ class SpellDataGenerator(DataGenerator):
           ( 383701, 1 ), # Gai Plin's Imperial Brew Heal
           ( 383733, 1 ), # Training of Niuzao Mastery % Buff
           ( 386959, 1 ), # Charred Passions Damage
+          ( 395267, 1 ), # Call to Arms Invoke Niuzao
 
           # Mistweaver
           ( 228649, 2 ), # Teachings of the Monastery - Blackout Proc
@@ -2182,8 +2221,11 @@ class SpellDataGenerator(DataGenerator):
           ( 390195, 1 ), # Chaos Theory talent buff
           ( 390145, 1 ), # Inner Demon talent buff
           ( 391374, 1 ), ( 391378, 1 ), ( 393054, 1 ), ( 393055, 1 ), # First Blood Chaos spells
-          ( 393628, 0 ), ( 393629, 0 ), # T29 Set Bonus Spells
-          ( 408754, 0 ), # T30 4pc Seething Potential damage buff
+          ( 393628, 1 ), ( 393629, 0 ), # T29 Set Bonus Spells
+          ( 408754, 1 ), # T30 4pc Seething Potential damage buff
+          ( 228532, 1 ), # Consume Lesser Soul heal
+          ( 328953, 1 ), # Consume Demon Soul heal
+          ( 328951, 1 ), # New Shattered Souls area trigger
 
           # Vengeance
           ( 203557, 2 ), # Felblade proc rate
@@ -2214,6 +2256,12 @@ class SpellDataGenerator(DataGenerator):
           ( 409848, 1 ), # 4t30 buff
           # Preservation
           ( 369299, 2 ), # Preservation Essence Burst
+          # Augmentation
+          ( 392268, 3 ), # Augmentation Essence Burst
+          ( 404908, 3 ), ( 413786, 3 ), # Fate Mirror Damage/Heal
+          ( 409632, 3 ), # Breath of Eons Damage
+          ( 360828, 3 ), # Blistering Scales
+          ( 410265, 3 ), # Inferno's Blessing
        ),
     ]
 
@@ -2246,19 +2294,19 @@ class SpellDataGenerator(DataGenerator):
     # Note, these are reset for MoP
     _spec_skill_categories = [
         (),
-        (   71,   72,  73,   0 ), # Warrior
-        (   65,   66,  70,   0 ), # Paladin
-        (  254,  255, 256,   0 ), # Hunter
-        (  259,  260, 261,   0 ), # Rogue
-        (  256,  257, 258,   0 ), # Priest
-        (  250,  251, 252,   0 ), # Death Knight
-        (  262,  263, 264,   0 ), # Shaman
-        (   62,   63,  64,   0 ), # Mage
-        (  265,  266, 267,   0 ), # Warlock
-        (  268,  270, 269,   0 ), # Monk
-        (  102,  103, 104, 105 ), # Druid
-        (  577,  581,   0,   0 ), # Demon Hunter
-        ( 1467, 1468,   0,   0 ), # Evoker
+        (   71,   72,   73,   0 ), # Warrior
+        (   65,   66,   70,   0 ), # Paladin
+        (  254,  255,  256,   0 ), # Hunter
+        (  259,  260,  261,   0 ), # Rogue
+        (  256,  257,  258,   0 ), # Priest
+        (  250,  251,  252,   0 ), # Death Knight
+        (  262,  263,  264,   0 ), # Shaman
+        (   62,   63,   64,   0 ), # Mage
+        (  265,  266,  267,   0 ), # Warlock
+        (  268,  270,  269,   0 ), # Monk
+        (  102,  103,  104, 105 ), # Druid
+        (  577,  581,    0,   0 ), # Demon Hunter
+        ( 1467, 1468, 1473,   0 ), # Evoker
     ]
 
     _race_categories = [
@@ -2396,6 +2444,7 @@ class SpellDataGenerator(DataGenerator):
         ( 218, 'misc_value_2' ),
         ( 219, 'misc_value_2' ),
         ( 507, 'misc_value_1' ),
+        ( 537, 'misc_value_1' ),
     ]
 
     _spell_blacklist = [
@@ -3691,7 +3740,12 @@ class SetBonusListGenerator(DataGenerator):
             'name'   : 'tier30',
             'bonuses': [ 1540, 1541, 1542, 1543, 1544, 1545, 1546, 1547, 1548, 1549, 1550, 1551, 1552 ],
             'tier'   : 30
-        }
+        },
+        {
+            'name'   : 'might_of_the_drogbar',
+            'bonuses': [ 1539 ],
+            'tier'   : 30
+        },
     ]
 
     @staticmethod

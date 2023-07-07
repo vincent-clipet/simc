@@ -5,7 +5,7 @@ level=70
 race=highmountain_tauren
 role=tank
 position=front
-talents=BgGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJSSiSSKSkkkAhEAAAAAAAAAAAAAAAAAA
+talents=BgGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgEJJRKJRikkEIkoBAkEEIQSSSSSkC0ScAAAAAAARARTAA
 
 # Default consumables
 potion=elemental_potion_of_ultimate_power_3
@@ -41,6 +41,7 @@ actions.precombat+=/bear_form,if=(!buff.prowl.up)
 actions=auto_attack,if=!buff.prowl.up
 actions+=/use_item,slot=trinket1
 actions+=/use_item,slot=trinket2
+actions+=/use_item,name=djaruun_pillar_of_the_elder_flame
 actions+=/potion,if=((talent.heart_of_the_wild.enabled&buff.heart_of_the_wild.up)|((buff.berserk_bear.up|buff.incarnation_guardian_of_ursoc.up)&(!druid.catweave_bear&!druid.owlweave_bear)))
 actions+=/run_action_list,name=catweave,if=(target.cooldown.pause_action.remains|time>=30)&druid.catweave_bear=1&buff.tooth_and_claw.remains>1.5&(buff.incarnation_guardian_of_ursoc.down&buff.berserk_bear.down)&(cooldown.thrash_bear.remains>0&cooldown.mangle.remains>0&dot.moonfire.remains>=2)|(buff.cat_form.up&energy>25&druid.catweave_bear=1&buff.tooth_and_claw.remains>1.5)|(buff.heart_of_the_wild.up&energy>90&druid.catweave_bear=1&buff.tooth_and_claw.remains>1.5)
 actions+=/run_action_list,name=bear
@@ -61,9 +62,9 @@ actions.bear+=/raze,if=buff.rage_of_the_sleeper.up&buff.tooth_and_claw.stack>0&v
 actions.bear+=/ironfur,target_if=!debuff.tooth_and_claw_debuff.up,if=!buff.ironfur.up&!cooldown.pause_action.remains&variable.If_build=0|rage>90&variable.If_build=0
 actions.bear+=/ironfur,if=rage>90&variable.If_build=1|(buff.incarnation.up|buff.berserk_bear.up)&rage>20&variable.If_build=1
 actions.bear+=/moonfire,if=buff.galactic_guardian.up&buff.galactic_guardian.remains<=2
-actions.bear+=/mangle,if=buff.gore.up&active_enemies<11|buff.vicious_cycle_mangle.stack=3
 actions.bear+=/maul,if=((buff.incarnation.up|buff.berserk_bear.up)&active_enemies<=5&(buff.tooth_and_claw.stack>=2))&variable.If_build=0&!talent.thorns_of_iron.enabled
-actions.bear+=/raze,if=((buff.incarnation.up|buff.berserk_bear.up)&(buff.tooth_and_claw.stack>=2))&variable.If_build=0&!talent.thorns_of_iron.enabled
+actions.bear+=/raze,if=(buff.incarnation.up|buff.berserk_bear.up)&variable.If_build=0&!talent.thorns_of_iron.enabled
+actions.bear+=/mangle,if=buff.gore.up&active_enemies<11|buff.vicious_cycle_mangle.stack=3
 actions.bear+=/thrash_bear,target_if=refreshable|dot.thrash_bear.stack<3|active_enemies>=5
 actions.bear+=/swipe,if=buff.incarnation_guardian_of_ursoc.down&buff.berserk_bear.down&active_enemies>=11
 actions.bear+=/maul,if=(buff.tooth_and_claw.up&active_enemies<=5)
@@ -105,7 +106,7 @@ main_hand=crux_of_blind_faith,id=201995,bonus_id=6652/8783/8784/7936/7937/6808/4
 # Gear Summary
 # gear_ilvl=421.40
 # gear_agility=5428
-# gear_stamina=13119
+# gear_stamina=17110
 # gear_attack_power=135
 # gear_crit_rating=3597
 # gear_haste_rating=3333

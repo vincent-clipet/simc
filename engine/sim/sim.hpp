@@ -228,6 +228,7 @@ struct sim_t : private sc_thread_t
 
   struct auras_t
   {
+    buff_t* fallback; // generic global fallback buff
     buff_t* arcane_intellect;
     buff_t* battle_shout;
     buff_t* mark_of_the_wild;
@@ -491,7 +492,7 @@ struct sim_t : private sc_thread_t
     // Chance for nearby enemies to move out of range for Allied Wristguards of Companionship
     double allied_wristguards_ally_leave_chance = 0.05;
     // Corrupting Rages Average Uptime
-    double corrupting_rage_uptime = 0.7;
+    double corrupting_rage_uptime = 0.80;
     // Hood of Surging Time proc chance when the period is set
     double hood_of_surging_time_chance = 0.0;
     // Hood of Surging Time proc period
@@ -507,11 +508,9 @@ struct sim_t : private sc_thread_t
     // Interval between checking blue_silken_lining_uptime
     timespan_t blue_silken_lining_update_interval = 5_s;
     // Enable or Disable Seething Black Dragonscale's damage
-    bool seething_black_dragonscale_damage = false;
-    // Set the dragonflight for Glimmering Chromatic Orb
-    std::string glimmering_chromatic_orb_dragonflight = "obsidian";
-    // Set the allies dragonflights for Glimmering Chromatic Orb
-    std::string glimmering_chromatic_orb_allies = "";
+    bool screaming_black_dragonscale_damage = false;
+    // Period in which to try to trigger adapative Stonescales. Based on spell data, does not trigger on periodic damage.
+    timespan_t adaptive_stonescales_period = 3_s;
   } dragonflight_opts;
 
   // Auras and De-Buffs
@@ -566,6 +565,7 @@ struct sim_t : private sc_thread_t
   std::string output_file_str, html_file_str, json_file_str;
   std::string reforge_plot_output_file_str;
   std::vector<std::string> error_list;
+  int display_build;
   int report_precision;
   int report_pets_separately;
   int report_targets;
@@ -731,6 +731,10 @@ struct sim_t : private sc_thread_t
 
   // Activates the necessary actor/actors before iteration begins.
   void activate_actors();
+
+  void heartbeat_event_callback();
+  std::vector<std::function<void(sim_t*)>> heartbeat_event_callback_function;
+  void register_heartbeat_event_callback( std::function<void( sim_t*)> fn );
 
   timespan_t current_time() const
   { return event_mgr.current_time; }

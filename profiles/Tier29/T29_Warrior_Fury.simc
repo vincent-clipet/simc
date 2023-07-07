@@ -13,7 +13,7 @@ potion=elemental_potion_of_ultimate_power_3
 flask=phial_of_tepid_versatility_3
 food=fated_fortune_cookie
 augmentation=draconic
-temporary_enchant=main_hand:howling_rune_3/off_hand:howling_rune_3
+temporary_enchant=main_hand:hissing_rune_3/off_hand:hissing_rune_3
 
 # This default action priority list is automatically created based on your character.
 # It is a attempt to provide you with a action list that is both simple and practicable,
@@ -25,10 +25,10 @@ temporary_enchant=main_hand:howling_rune_3/off_hand:howling_rune_3
 actions.precombat=flask
 actions.precombat+=/food
 actions.precombat+=/augmentation
-actions.precombat+=/berserker_stance,toggle=on
 # Snapshot raid buffed stats before combat begins and pre-potting is done.
 actions.precombat+=/snapshot_stats
 actions.precombat+=/use_item,name=algethar_puzzle_box
+actions.precombat+=/berserker_stance,toggle=on
 actions.precombat+=/avatar,if=!talent.titans_torment
 actions.precombat+=/recklessness,if=!talent.reckless_abandon
 
@@ -38,15 +38,19 @@ actions+=/charge,if=time<=0.5|movement.distance>5
 actions+=/heroic_leap,if=(raid_event.movement.distance>25&raid_event.movement.in>45)
 actions+=/potion
 actions+=/pummel,if=target.debuff.casting.react
+actions+=/use_item,name=algethar_puzzle_box,if=cooldown.recklessness.remains<3|(talent.anger_management&cooldown.avatar.remains<3)
+actions+=/use_item,name=vial_of_animated_blood,if=buff.avatar.up
+actions+=/use_item,name=irideus_fragment,if=buff.avatar.up
 actions+=/use_item,name=manic_grieftorch,if=buff.avatar.down
+actions+=/use_item,name=gladiators_badge,if=cooldown.recklessness.remains>10&(buff.recklessness.up|target.time_to_die<11|target.time_to_die>65)
+actions+=/use_items
 actions+=/ravager,if=cooldown.recklessness.remains<3|buff.recklessness.up
-actions+=/blood_fury
-actions+=/berserking,if=buff.recklessness.up
 actions+=/lights_judgment,if=buff.recklessness.down
+actions+=/berserking,if=buff.recklessness.up
+actions+=/blood_fury
 actions+=/fireblood
 actions+=/ancestral_call
-actions+=/bag_of_tricks
-actions+=/avatar,if=talent.titans_torment&buff.enrage.up&raid_event.adds.in>15|!talent.titans_torment&(buff.recklessness.up|target.time_to_die<20)
+actions+=/avatar,if=talent.titans_torment&buff.enrage.up&raid_event.adds.in>15|talent.berserkers_torment&buff.enrage.up&!buff.avatar.up&raid_event.adds.in>15|!talent.titans_torment&!talent.berserkers_torment&(buff.recklessness.up|target.time_to_die<20)
 actions+=/recklessness,if=!raid_event.adds.exists&(talent.annihilator&cooldown.avatar.remains<1|cooldown.avatar.remains>40|!talent.avatar|target.time_to_die<12)
 actions+=/recklessness,if=!raid_event.adds.exists&!talent.annihilator|target.time_to_die<12
 actions+=/spear_of_bastion,if=buff.enrage.up&(buff.recklessness.up|buff.avatar.up|target.time_to_die<20|active_enemies>1)&raid_event.adds.in>15
@@ -59,6 +63,8 @@ actions.multi_target+=/whirlwind,if=spell_targets.whirlwind>1&talent.improved_wh
 actions.multi_target+=/execute,if=buff.ashen_juggernaut.up&buff.ashen_juggernaut.remains<gcd
 actions.multi_target+=/thunderous_roar,if=buff.enrage.up&(spell_targets.whirlwind>1|raid_event.adds.in>15)
 actions.multi_target+=/odyns_fury,if=active_enemies>1&buff.enrage.up&raid_event.adds.in>15
+actions.multi_target+=/bloodbath,if=set_bonus.tier30_4pc&action.bloodthirst.crit_pct_current>=95
+actions.multi_target+=/bloodthirst,if=set_bonus.tier30_4pc&action.bloodthirst.crit_pct_current>=95
 actions.multi_target+=/crushing_blow,if=talent.wrath_and_fury&buff.enrage.up
 actions.multi_target+=/execute,if=buff.enrage.up
 actions.multi_target+=/odyns_fury,if=buff.enrage.up&raid_event.adds.in>15
@@ -85,6 +91,8 @@ actions.single_target+=/execute,if=buff.ashen_juggernaut.up&buff.ashen_juggernau
 actions.single_target+=/thunderous_roar,if=buff.enrage.up&(spell_targets.whirlwind>1|raid_event.adds.in>15)
 actions.single_target+=/odyns_fury,if=buff.enrage.up&(spell_targets.whirlwind>1|raid_event.adds.in>15)&(talent.dancing_blades&buff.dancing_blades.remains<5|!talent.dancing_blades)
 actions.single_target+=/rampage,if=talent.anger_management&(buff.recklessness.up|buff.enrage.remains<gcd|rage.pct>85)
+actions.single_target+=/bloodbath,if=set_bonus.tier30_4pc&action.bloodthirst.crit_pct_current>=95
+actions.single_target+=/bloodthirst,if=set_bonus.tier30_4pc&action.bloodthirst.crit_pct_current>=95
 actions.single_target+=/execute,if=buff.enrage.up
 actions.single_target+=/onslaught,if=buff.enrage.up|talent.tenderize
 actions.single_target+=/crushing_blow,if=talent.wrath_and_fury&buff.enrage.up
@@ -129,10 +137,10 @@ off_hand=incarnate_skysplitter,id=195528,bonus_id=4800/4786/1498,enchant_id=6649
 # Gear Summary
 # gear_ilvl=421.63
 # gear_strength=5920
-# gear_stamina=14535
+# gear_stamina=18947
 # gear_crit_rating=3120
-# gear_haste_rating=3737
-# gear_mastery_rating=3746
+# gear_haste_rating=3117
+# gear_mastery_rating=4366
 # gear_versatility_rating=1735
 # gear_armor=7108
 # gear_bonus_armor=141

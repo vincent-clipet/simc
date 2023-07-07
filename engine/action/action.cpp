@@ -367,6 +367,7 @@ action_t::action_t( action_e ty, util::string_view token, player_t* p, const spe
     tick_on_application( false ),
     hasted_ticks(),
     consume_per_tick_(),
+    rolling_periodic(),
     split_aoe_damage(),
     reduced_aoe_targets( 0.0 ),
     full_amount_targets( 0 ),
@@ -581,12 +582,12 @@ static bool is_periodic_damage_effect( const spelleffect_data_t& effect )
          range::contains( subtypes, effect.subtype() );
 }
 
-static bool has_direct_damage_effect( const spell_data_t& spell )
+bool action_t::has_direct_damage_effect( const spell_data_t& spell )
 {
   return range::any_of( spell.effects(), is_direct_damage_effect );
 }
 
-static bool has_periodic_damage_effect( const spell_data_t& spell )
+bool action_t::has_periodic_damage_effect( const spell_data_t& spell )
 {
   return range::any_of( spell.effects(), is_periodic_damage_effect );
 }
@@ -615,6 +616,7 @@ void action_t::parse_spell_data( const spell_data_t& spell_data )
   tick_may_crit       = spell_data.flags( spell_attribute::SX_TICK_MAY_CRIT );
   hasted_ticks        = spell_data.flags( spell_attribute::SX_DOT_HASTED );
   tick_on_application = spell_data.flags( spell_attribute::SX_TICK_ON_APPLICATION );
+  rolling_periodic    = spell_data.flags( spell_attribute::SX_ROLLING_PERIODIC );
   ignores_armor       = spell_data.flags( spell_attribute::SX_TREAT_AS_PERIODIC );
   may_miss            = !spell_data.flags( spell_attribute::SX_ALWAYS_HIT );
   may_dodge = may_parry = may_block = !spell_data.flags( spell_attribute::SX_NO_D_P_B );
@@ -1280,8 +1282,9 @@ double action_t::calculate_tick_amount( action_state_t* state, double dot_multip
 
   amount = floor( base_ta( state ) + 0.5 );
   amount += bonus_ta( state );
-  amount += state->composite_spell_power() * spell_tick_power_coefficient( state );
-  amount += state->composite_attack_power() * attack_tick_power_coefficient( state );
+  double rolling_ta_multiplier = state->composite_rolling_ta_multiplier();
+  amount += state->composite_spell_power() * spell_tick_power_coefficient( state ) * rolling_ta_multiplier;
+  amount += state->composite_attack_power() * attack_tick_power_coefficient( state ) * rolling_ta_multiplier;
   amount *= state->composite_ta_multiplier();
 
   double init_tick_amount = amount;
@@ -1685,13 +1688,8 @@ void action_t::execute()
   num_targets_hit              = 0;
   interrupt_immediate_occurred = false;
 
-  if ( harmful )
-  {
-    if ( !player->in_combat && sim->debug )
-      sim->print_debug( "{} enters combat.", *player );
-
-    player->in_combat = true;
-  }
+  if ( harmful && !player->in_combat )
+    player->enter_combat();
 
   // Handle tick_action initial state snapshotting, primarily for handling STATE_MUL_PERSISTENT
   if ( tick_action )
@@ -1797,22 +1795,15 @@ void action_t::execute()
     {
       // "On spell cast", only performed for foreground actions
       if ( ( pt2 = execute_state->cast_proc_type2() ) != PROC2_INVALID )
-      {
-        action_callback_t::trigger( player->callbacks.procs[ pt ][ pt2 ], this, execute_state );
-      }
+        player->trigger_callbacks( pt, pt2, this, execute_state );
 
       // "On an execute result"
       if ( ( pt2 = execute_state->execute_proc_type2() ) != PROC2_INVALID )
-      {
-        action_callback_t::trigger( player->callbacks.procs[ pt ][ pt2 ], this, execute_state );
-      }
+        player->trigger_callbacks( pt, pt2, this, execute_state );
 
       // "On interrupt cast result"
       if ( ( pt2 = execute_state->interrupt_proc_type2() ) != PROC2_INVALID )
-      {
-        if ( execute_state->target->debuffs.casting->check() )
-          action_callback_t::trigger( player->callbacks.procs[ pt ][ pt2 ], this, execute_state );
-      }
+        player->trigger_callbacks( pt, pt2, this, execute_state );
     }
 
     // Special handling for "Cast Successful" procs
@@ -1823,22 +1814,15 @@ void action_t::execute()
 
       // "On spell cast", only performed for foreground actions
       if ( ( pt2 = execute_state->cast_proc_type2() ) != PROC2_INVALID )
-      {
-        action_callback_t::trigger( player->callbacks.procs[ pt ][ pt2 ], this, execute_state );
-      }
+        player->trigger_callbacks( pt, pt2, this, execute_state );
 
       // "On an execute result"
       if ( ( pt2 = execute_state->execute_proc_type2() ) != PROC2_INVALID )
-      {
-        action_callback_t::trigger( player->callbacks.procs[ pt ][ pt2 ], this, execute_state );
-      }
+        player->trigger_callbacks( pt, pt2, this, execute_state );
 
       // "On interrupt cast result"
       if ( ( pt2 = execute_state->interrupt_proc_type2() ) != PROC2_INVALID )
-      {
-        if ( execute_state->target->debuffs.casting->check() )
-          action_callback_t::trigger( player->callbacks.procs[ pt ][ pt2 ], this, execute_state );
-      }
+        player->trigger_callbacks( pt, pt2, this, execute_state );
     }
   }
 
@@ -1912,13 +1896,15 @@ void action_t::tick( dot_t* d )
 
     if ( dynamic_tick_action )
     {
-      tick_action->update_state( tick_state, amount_type( tick_state, tick_action->direct_tick ) );
-    }
+      auto flags_ = tick_action->update_flags;
 
-    // Apply the last tick factor from the DoT to the base damage multipliers for partial ticks
-    // 6/23/2018 -- Revert the previous logic of overwriting the da modifiers with ta modifiers
-    tick_state->da_multiplier *= d->get_tick_factor();
-    tick_state->ta_multiplier *= d->get_tick_factor();
+      // ticks actions that are also rolling periodics need to force update composite_rolling_ta_multiplier on every
+      // tick_action execute
+      if ( tick_action->rolling_periodic )
+        flags_ |= STATE_ROLLING_TA;
+
+      tick_action->update_state( tick_state, flags_, amount_type( tick_state, tick_action->direct_tick ) );
+    }
 
     tick_action->schedule_execute( tick_state );
 
@@ -2533,10 +2519,17 @@ void action_t::init()
   if ( quiet )
     stats->quiet = true;
 
+  if ( rolling_periodic )
+  {
+    // Rolling Periodic refresh behavior overrides other behaviors.
+    dot_behavior = dot_behavior_e::DOT_ROLLING;
+    snapshot_flags |= STATE_ROLLING_TA;
+  }
+
   if ( may_crit || tick_may_crit )
     snapshot_flags |= STATE_CRIT | STATE_TGT_CRIT;
 
-  if ( ( base_td > 0 || spell_power_mod.tick > 0 || attack_power_mod.tick > 0 ) && dot_duration > timespan_t::zero() )
+  if ( ( base_td > 0 || spell_power_mod.tick > 0 || attack_power_mod.tick > 0 ) && dot_duration > 0_ms )
     snapshot_flags |= STATE_MUL_TA | STATE_TGT_MUL_TA | STATE_MUL_PERSISTENT | STATE_VERSATILITY;
 
   if ( base_dd_min > 0 || ( spell_power_mod.direct > 0 || attack_power_mod.direct > 0 ) || weapon_multiplier > 0 )
@@ -2554,7 +2547,7 @@ void action_t::init()
   if ( data().flags( spell_attribute::SX_DISABLE_PLAYER_MULT ) ||
        data().flags( spell_attribute::SX_DISABLE_PLAYER_HEALING_MULT ) )
   {
-    snapshot_flags &= ~( STATE_VERSATILITY );
+    snapshot_flags &= ~( STATE_VERSATILITY | STATE_MUL_PLAYER_DAM );
   }
 
   if ( data().flags( spell_attribute::SX_DISABLE_TARGET_MULT ) )
@@ -2589,6 +2582,9 @@ void action_t::init()
   // WOD: Yank out persistent multiplier from update flags, so they get
   // snapshot once at the application of the spell
   update_flags &= ~STATE_MUL_PERSISTENT;
+
+  // The Rolling Periodic multiplier is only updated when the DoT is applied or refreshed
+  update_flags &= ~STATE_ROLLING_TA;
 
   // Channeled dots get haste snapshoted
   if ( channeled )
@@ -4000,11 +3996,17 @@ void action_t::snapshot_internal( action_state_t* state, unsigned flags, result_
   if ( flags & STATE_VERSATILITY )
     state->versatility = composite_versatility( state );
 
-  if ( flags & STATE_MUL_DA )
+  if ( flags & STATE_MUL_SPELL_DA )
     state->da_multiplier = composite_da_multiplier( state );
 
-  if ( flags & STATE_MUL_TA )
+  if ( flags & STATE_MUL_SPELL_TA )
     state->ta_multiplier = composite_ta_multiplier( state );
+
+  if ( flags & STATE_ROLLING_TA )
+    state->rolling_ta_multiplier = composite_rolling_ta_multiplier( state );
+
+  if ( flags & STATE_MUL_PLAYER_DAM )
+    state->player_multiplier = composite_player_multiplier( state );
 
   if ( flags & STATE_MUL_PERSISTENT )
     state->persistent_multiplier = composite_persistent_multiplier( state );
@@ -4107,15 +4109,6 @@ void action_t::impact( action_state_t* s )
   {
     sim->print_log( "Target {} avoids {} {} ({})", *s->target, *player, *this, s->result );
   }
-
-  // Handle Heirmir Marrowed Gemstone Soulbind
-  if ( this -> player -> type == PLAYER_PET && s -> result == RESULT_CRIT )
-  {
-    auto counter_buff = buff_t::find( debug_cast<pet_t*>( this -> player ) -> owner, "marrowed_gemstone_charging" );
-    auto buff = buff_t::find( debug_cast<pet_t*>( this -> player ) -> owner, "marrowed_gemstone_enhancement" );
-    if ( buff && counter_buff && buff -> cooldown -> up() )
-      counter_buff -> trigger();
-  }
 }
 
 void action_t::trigger_dot( action_state_t* s )
@@ -4214,6 +4207,10 @@ timespan_t action_t::calculate_dot_refresh_duration( const dot_t* dot, timespan_
   {
     case dot_behavior_e::DOT_REFRESH_PANDEMIC:
       return std::max( dot->remains(), std::min( triggered_duration * 0.3, dot->remains() ) + triggered_duration );
+    case dot_behavior_e::DOT_ROLLING:
+      if ( dot->ticks_left_fractional() < 1.0 )
+        return triggered_duration;
+      return dot->time_to_next_full_tick() + triggered_duration;
     case dot_behavior_e::DOT_REFRESH_DURATION:
       return dot->time_to_next_full_tick() + triggered_duration;
     case dot_behavior_e::DOT_EXTEND:
@@ -4235,6 +4232,7 @@ bool action_t::dot_refreshable( const dot_t* dot, timespan_t triggered_duration 
     case dot_behavior_e::DOT_REFRESH_DURATION:
       return dot->ticks_left() <= 1;
     case dot_behavior_e::DOT_EXTEND:
+    case dot_behavior_e::DOT_ROLLING:
       return true;
     case dot_behavior_e::DOT_NONE:
     case dot_behavior_e::DOT_CLIP:
@@ -4517,40 +4515,53 @@ double action_t::composite_total_corruption() const
   return player->composite_total_corruption();
 }
 
-double action_t::composite_da_multiplier(const action_state_t*) const
+double action_t::composite_player_multiplier( const action_state_t* ) const
 {
-  double base_multiplier = action_multiplier();
-  double direct_multiplier = action_da_multiplier();
   double player_school_multiplier = 0.0;
   double tmp;
 
-  for (auto base_school : base_schools)
+  for ( auto base_school : base_schools )
   {
-    tmp = player->cache.player_multiplier(base_school);
-    if (tmp > player_school_multiplier) player_school_multiplier = tmp;
+    tmp = player->cache.player_multiplier( base_school );
+    if ( tmp > player_school_multiplier )
+      player_school_multiplier = tmp;
   }
 
-  return base_multiplier * direct_multiplier * player_school_multiplier *
-    player->composite_player_dd_multiplier(get_school(), this);
+  return player_school_multiplier;
 }
 
-/// Normal ticking modifiers that are updated every tick
-
-double action_t::composite_ta_multiplier(const action_state_t*) const
+double action_t::composite_da_multiplier( const action_state_t* ) const
 {
-  double base_multiplier = action_multiplier();
-  double tick_multiplier = action_ta_multiplier();
-  double player_school_multiplier = 0.0;
-  double tmp;
+  return action_multiplier() * action_da_multiplier();
+}
 
-  for (auto base_school : base_schools)
+double action_t::composite_ta_multiplier( const action_state_t* ) const
+{
+  return action_multiplier() * action_ta_multiplier();
+}
+
+double action_t::composite_rolling_ta_multiplier( const action_state_t* s ) const
+{
+  // The behavior of Rolling Periodic DoTs can be modeled by keeping track of a multiplier.
+  // A single instance of the DoT has a multiplier of 1.0 for all ticks. When the DoT is
+  // refreshed early, the damage from any remaining ticks is rolled into multiplier so that
+  // damage is not lost.
+  double m = 1.0;
+
+  dot_t* dot = find_dot( s->target );
+  if ( dot && dot->is_ticking() )
   {
-    tmp = player->cache.player_multiplier(base_school);
-    if (tmp > player_school_multiplier) player_school_multiplier = tmp;
+    double ticks_left = dot->ticks_left_fractional();
+    double new_base_ticks = composite_dot_duration( s ) / tick_time( s );
+    // Calculate ticks_left_fractional for the DoT after it is refreshed.
+    double new_ticks_left = 1.0 + ( calculate_dot_refresh_duration( dot, composite_dot_duration( s ) ) - dot->time_to_next_full_tick() ) / tick_time( s );
+    // Roll the multiplier for the old ticks that will be lost into a multiplier for the new DoT.
+    m = ( ticks_left * s->rolling_ta_multiplier + new_base_ticks ) / new_ticks_left;
+    sim->print_debug( "{} {} rolling_ta_multiplier updated: old_multiplier={} to new_multiplier={} ticks_left={} new_base_ticks={} new_ticks_left={}.",
+      *player, *this, s->rolling_ta_multiplier, m, ticks_left, new_base_ticks, new_ticks_left );
   }
 
-  return base_multiplier * tick_multiplier * player_school_multiplier *
-    player->composite_player_td_multiplier(get_school(), this);
+  return m;
 }
 
 /// Persistent modifiers that are snapshot at the start of the spell cast
@@ -5021,11 +5032,9 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
     const auto& spell_text = player->dbc->spell_text( spell.id() );
     if ( spell_text.rank() )
       desc_str = fmt::format( " (desc={})", spell_text.rank() );
-    if ( sim->debug )
-    {
-      sim->print_debug( "{} {} is affected by effect {} ({}{} (id={}) - effect #{})", *player, *this, effect.id(),
-                        spell.name_cstr(), desc_str, spell.id(), effect.spell_effect_num() + 1 );
-    }
+
+    sim->print_debug( "{} {} is affected by effect {} ({}{} (id={}) - effect #{})", *player, *this, effect.id(),
+                      spell.name_cstr(), desc_str, spell.id(), effect.spell_effect_num() + 1 );
   }
 
   // Applies "Spell Effect N" auras if they directly affect damage auras
@@ -5103,6 +5112,17 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
                           effect.resource( current_resource() ) );
         break;
 
+      case P_RESOURCE_COST_2:
+      {
+        if ( data().powers().size() < 3 )
+          break;
+        // Resource Cost 2 is actually the third resource as it's Zero Indexed.
+        resource_e resource = data().powers()[ 2 ].resource();
+        base_costs[ resource ] += effect.resource( resource );
+        sim->print_debug( "{} base resource cost for resource {} modified by {}", *this, resource,
+                          effect.resource( resource ) );
+        break;
+      }
       case P_TARGET:
         assert( !( aoe == -1 || ( effect.base_value() < 0 && effect.base_value() > aoe ) ) );
         if ( aoe > 0 )
@@ -5185,6 +5205,18 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
         sim->print_debug( "{} base resource cost for resource {} modified by {}%", *this,
                           resource_current, effect.base_value() );
         break;
+                
+      case P_RESOURCE_COST_2:
+      {
+        if ( data().powers().size() < 3 )
+          break;
+        // Zero Indexed, this is the third cost.
+        resource_e resource = data().powers()[ 2 ].resource();
+        base_costs[ resource ] *= 1.0 + effect.percent();
+        sim->print_debug( "{} base resource cost for resource {} modified by {}%", *this, resource,
+                          effect.base_value() );
+        break;
+      }
 
       case P_TARGET_BONUS:
         // Chain Bonus Damage is base 0.0 and applied as 1.0 + chain_bonus_damage in action_t::calculate_direct_amount
@@ -5306,7 +5338,7 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
         break;
 
       case A_MOD_MAX_CHARGES:
-        if ( cooldown->action == this )
+        if ( cooldown->action == this && data().charge_cooldown() > 0_ms )
         {
           cooldown->charges += as<int>( effect.base_value() );
           sim->print_debug( "{} cooldown charges modified by {}", *this, as<int>( effect.base_value() ) );
@@ -5336,8 +5368,11 @@ void action_t::apply_affecting_effect( const spelleffect_data_t& effect )
         break;
 
       case A_MOD_RECHARGE_MULTIPLIER:
-        base_recharge_multiplier *= 1 + effect.percent();
-        sim->print_debug( "{} cooldown recharge multiplier modified by {}%", *this, effect.base_value() );
+        if ( data().charge_cooldown() > 0_ms )
+        {
+          base_recharge_multiplier *= 1 + effect.percent();
+          sim->print_debug( "{} cooldown recharge multiplier modified by {}%", *this, effect.base_value() );
+        }
         break;
 
       default:

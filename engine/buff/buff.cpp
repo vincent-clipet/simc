@@ -2731,6 +2731,11 @@ static buff_t* find_potion_buff( util::span<buff_t* const> buffs, player_t* sour
     }
   }
 
+  if ( source )
+  {
+    return source->sim->auras.fallback;
+  }
+
   return nullptr;
 }
 
@@ -2797,6 +2802,9 @@ buff_t* buff_t::find( sim_t* s, util::string_view name )
 
 buff_t* buff_t::find( player_t* p, util::string_view name, player_t* source )
 {
+  if ( range::contains( p->fallback_buff_names, name ) )
+    return p->sim->auras.fallback;
+
   return find( p->buff_list, name, source );
 }
 
@@ -3041,7 +3049,7 @@ stat_buff_t* stat_buff_t::add_stat_from_effect( size_t i, double a, const stat_c
 
   if ( eff.subtype() == A_MOD_STAT )
   {
-    auto misc = eff.misc_value1();
+    auto misc   = eff.misc_value1();
     stat_e stat = STAT_NONE;
 
     if ( misc >= 0 )
@@ -3064,6 +3072,17 @@ stat_buff_t* stat_buff_t::add_stat_from_effect( size_t i, double a, const stat_c
 
       return this;
     }
+  }
+  else if ( eff.subtype() == A_MOD_SUPPORT_STAT )
+  {
+    auto misc   = eff.misc_value1();
+    stat_e stat = STAT_NONE;
+
+    if ( misc == 1 )
+      stat = player->convert_hybrid_stat( STAT_STR_AGI_INT );
+
+    if ( stat != STAT_NONE )
+      return add_stat( stat, a, c );
   }
 
   return do_error( "STAT_NONE" );

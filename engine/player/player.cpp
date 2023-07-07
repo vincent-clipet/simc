@@ -1065,9 +1065,8 @@ player_t::player_t( sim_t* s, player_e t, util::string_view n, race_e r )
     region_str( s->default_region_str ),
     server_str( s->default_server_str ),
     origin_str(),
-    timeofday( DAY_TIME ),  // Set to Day by Default since in raid it always switches to Day, user can override.
-    zandalari_loa(
-        PAKU ),  // Set loa to paku by default (as it has some gain for any role if not optimal), user can override
+    timeofday( NIGHT_TIME ),  // Depends on server time, default to night that's more common for raid hours
+    zandalari_loa( PAKU ),  // Default to Paku as it has some non-zero dps benefit for all specs
     vulpera_tricks( CORROSIVE ),  // default trick for damage
     gcd_ready( timespan_t::zero() ),
     base_gcd( timespan_t::from_seconds( 1.5 ) ),
@@ -1123,6 +1122,7 @@ player_t::player_t( sim_t* s, player_e t, util::string_view n, race_e r )
     off_gcd_ready( timespan_t::min() ),
     cast_while_casting_ready( timespan_t::min() ),
     in_combat( false ),
+    in_boss_encounter( 1 ),
     action_queued( false ),
     first_cast( true ),
     last_foreground_action( nullptr ),
@@ -1300,6 +1300,16 @@ player_t::player_t( sim_t* s, player_e t, util::string_view n, race_e r )
       "dps.\n"
       "# Feel free to edit, adapt and improve it to your own needs.\n"
       "# SimulationCraft is always looking for updates and improvements to the default action lists.\n";
+
+  if ( !is_pet() && !is_enemy() )
+  {
+    sim->register_heartbeat_event_callback( [ this ]( sim_t* ) {
+      for ( auto& pet : active_pets )
+      {
+        pet->update_stats();
+      }
+    } );
+  }
 }
 
 // Added in source file to get full definitions of all objects to destruct here;
@@ -2512,26 +2522,9 @@ static bool generate_tree_nodes( player_t* player,
 // Different entries within the same node are allowed to have non-unique selection indices. Every new build, it seems
 // random which node becomes the first choice. Manually resolve such conflicts here.
 // ***THIS WILL NEED TO BE CONFIRMED AND UPDATED EVERY NEW BUILD***
-static bool sort_node_entries( const trait_data_t* a, const trait_data_t* b, bool is_ptr )
+static bool sort_node_entries( const trait_data_t* a, const trait_data_t* b, bool /* is_ptr */ )
 {
-  auto get_index = [ is_ptr ]( const trait_data_t* t ) -> short {
-    if ( !is_ptr && t->selection_index != -1 )
-    {
-      switch ( t->id_trait_node_entry )
-      {
-        // Balance Druid overrides
-        case 109873:  // starweaver
-          return 200;
-        case 109872:  // rattle the stars
-          return 100;
-        case 109859:  // fury of elune
-          return 100;
-        case 109860:  // new moon
-          return 200;
-        default:
-          break;
-      }
-    }
+  auto get_index = [ /* is_ptr */ ]( const trait_data_t* t ) -> short {
     return t->selection_index;
   };
 
@@ -3204,13 +3197,9 @@ void player_t::init_background_actions()
 {
   if ( !is_enemy() )
   {
-    const spell_data_t* s = find_mastery_spell( specialization() );
-    if ( s->ok() )
-      _mastery = &( s->effectN( 1 ) );
-
-    if (record_healing())
+    if ( record_healing() )
     {
-      spells.leech = new leech_t(this);
+      spells.leech = new leech_t( this );
     }
   }
 }
@@ -3528,7 +3517,7 @@ void player_t::init_assessors()
     proc_types pt   = state->proc_type();
     proc_types2 pt2 = state->impact_proc_type2();
     if ( pt != PROC1_INVALID && pt2 != PROC2_INVALID )
-      action_callback_t::trigger( callbacks.procs[ pt ][ pt2 ], state->action, state );
+      trigger_callbacks( pt, pt2, state->action, state );
 
     return assessor::CONTINUE;
   } );
@@ -3921,7 +3910,7 @@ void player_t::create_buffs()
       buffs.lifeblood->add_stat( convert_hybrid_stat( STAT_STR_AGI_INT ),
         worldvein_resonance.spell( 1, essence_type::MINOR )->effectN( 5 ).average( worldvein_resonance.item() ) );
 
-      buffs.seething_rage = make_buff( this, "seething_rage", find_spell( 297126 ) )
+      buffs.seething_rage_essence = make_buff( this, "seething_rage_essence", find_spell( 297126 ) )
         ->set_default_value( find_spell( 297126 )->effectN( 1 ).percent() );
 
       buffs.guardian_of_azeroth = make_buff( this, "guardian_of_azeroth", find_spell( 295855 ) )
@@ -4048,11 +4037,6 @@ void player_t::create_buffs()
         ->set_pct_buff_type( STAT_PCT_BUFF_HASTE )
         ->set_pct_buff_type( STAT_PCT_BUFF_VERSATILITY )
         ->set_pct_buff_type( STAT_PCT_BUFF_CRIT );
-
-      // 10.0 M+ Affix Thundering
-      buffs.mark_of_lightning = make_buff( this, "mark_of_lightning", find_spell( 396369 ) )
-        ->add_invalidate( CACHE_PLAYER_DAMAGE_MULTIPLIER )
-        ->set_default_value_from_effect( 3 );
     }
   }
   // .. for enemies
@@ -4810,9 +4794,6 @@ double player_t::composite_player_pet_damage_multiplier( const action_state_t*, 
 
   m *= 1.0 + racials.command->effectN(1).percent();
 
-  if (buffs.mark_of_lightning && buffs.mark_of_lightning->check())
-    m *= 1.0 + buffs.mark_of_lightning->check_value();
-
   if (!guardian)
   {
     if (buffs.coldhearted && buffs.coldhearted->check())
@@ -4868,15 +4849,7 @@ double player_t::composite_player_multiplier( school_e school ) const
   if ( buffs.coldhearted && buffs.coldhearted->check() )
     m *= 1.0 + buffs.coldhearted->check_value();
 
-  if ( buffs.mark_of_lightning && buffs.mark_of_lightning->check() )
-    m *= 1.0 + buffs.mark_of_lightning->check_value();
-
   return m;
-}
-
-double player_t::composite_player_td_multiplier( school_e /* school */, const action_t* /* a */ ) const
-{
-  return 1.0;
 }
 
 double player_t::composite_player_target_multiplier( player_t* target, school_e /* school */ ) const
@@ -4982,8 +4955,8 @@ double player_t::composite_player_critical_damage_multiplier( const action_state
     m *= 1.0 + buffs.incensed->check_value();
 
   // Critical hit damage buff from R3 Blood of the Enemy major on-use
-  if ( buffs.seething_rage )
-    m *= 1.0 + buffs.seething_rage->check_value();
+  if ( buffs.seething_rage_essence )
+    m *= 1.0 + buffs.seething_rage_essence->check_value();
 
   // Critical hit damage buff from follower themed Benthic boots
   if ( buffs.fathom_hunter )
@@ -5313,13 +5286,19 @@ void player_t::invalidate_cache( cache_e c )
   {
     case CACHE_STRENGTH:
       if ( current.attack_power_per_strength > 0 )
+      {
         invalidate_cache( CACHE_ATTACK_POWER );
+        invalidate_cache( CACHE_TOTAL_MELEE_ATTACK_POWER );
+      }
       if ( current.parry_per_strength > 0 )
         invalidate_cache( CACHE_PARRY );
       break;
     case CACHE_AGILITY:
       if ( current.attack_power_per_agility > 0 )
+      {
         invalidate_cache( CACHE_ATTACK_POWER );
+        invalidate_cache( CACHE_TOTAL_MELEE_ATTACK_POWER );
+      }
       if ( current.dodge_per_agility > 0 )
         invalidate_cache( CACHE_DODGE );
       if ( current.attack_crit_per_agility > 0 )
@@ -5333,9 +5312,13 @@ void player_t::invalidate_cache( cache_e c )
       break;
     case CACHE_SPELL_POWER:
       if ( current.attack_power_per_spell_power > 0 )
+      {
         invalidate_cache( CACHE_ATTACK_POWER );
+        invalidate_cache( CACHE_TOTAL_MELEE_ATTACK_POWER );
+      }
       break;
     case CACHE_ATTACK_POWER:
+      invalidate_cache( CACHE_TOTAL_MELEE_ATTACK_POWER );
       if ( current.spell_power_per_attack_power > 0 )
         invalidate_cache( CACHE_SPELL_POWER );
       break;
@@ -5430,10 +5413,10 @@ void player_t::sequence_add( const action_t* a, const player_t* target, timespan
   {
     if ( collected_data.action_sequence.size() <= sim->expected_max_time() * 2.0 + 3.0 )
     {
-      if ( in_combat )
-        collected_data.action_sequence.emplace_back( a, target, ts, this );
-      else
+      if ( a->is_precombat )
         collected_data.action_sequence_precombat.emplace_back( a, target, ts, this );
+      else
+        collected_data.action_sequence.emplace_back( a, target, ts, this );
     }
     else
     {
@@ -5501,7 +5484,7 @@ void player_t::combat_begin()
   first_cast = false;
 
   if ( !precombat_action_list.empty() )
-    in_combat = true;
+    enter_combat();
 
   // re-initialize collected_data.health_changes.previous_*_level
   // necessary because food/flask are counted as resource gains, and thus provide phantom
@@ -5540,6 +5523,7 @@ void player_t::combat_begin()
   };
 
   add_timed_buff_triggers( external_buffs.power_infusion, buffs.power_infusion );
+  add_timed_buff_triggers( external_buffs.symbol_of_hope, buffs.symbol_of_hope );
   add_timed_buff_triggers( external_buffs.conquerors_banner, buffs.conquerors_banner );
   add_timed_buff_triggers( external_buffs.rallying_cry, buffs.rallying_cry );
   add_timed_buff_triggers( external_buffs.pact_of_the_soulstalkers, buffs.pact_of_the_soulstalkers );
@@ -5558,7 +5542,7 @@ void player_t::combat_begin()
   add_timed_blessing_triggers( external_buffs.blessing_of_winter, buffs.blessing_of_winter );
   add_timed_blessing_triggers( external_buffs.blessing_of_spring, buffs.blessing_of_spring );
 
-  if ( buffs.windfury_totem && may_benefit_from_windfury_totem() )
+  if ( buffs.windfury_totem && sim->overrides.windfury_totem && may_benefit_from_windfury_totem() )
   {
     buffs.windfury_totem->trigger();
   }
@@ -6034,6 +6018,11 @@ void player_t::reset()
   cast_while_casting_poll_event = nullptr;
   in_combat       = false;
 
+  if ( sim->fight_style == FIGHT_STYLE_DUNGEON_ROUTE || sim->fight_style == FIGHT_STYLE_DUNGEON_SLICE )
+    in_boss_encounter = 0;
+  else
+    in_boss_encounter = 1;
+
   current_execute_type = execute_type::FOREGROUND;
 
   current_attack_speed    = 1.0;
@@ -6507,6 +6496,8 @@ void player_t::demise()
   if ( current.sleeping )
     return;
 
+  leave_combat();
+
   current.sleeping = true;
 
   if ( sim->log )
@@ -6582,6 +6573,35 @@ void player_t::demise()
     sim->active_allies--;
     sim->player_non_sleeping_list.find_and_erase_unordered( this );
   }
+}
+
+// Player enters/leaves "combat". Primarily relevant for DungeonSlice/DungeonRoute sims where "combat" is defined as
+// sim_t::target_non_sleeping_list.size() > 0
+// Use index-based lookup since enter/leaving combat may insert new combat state callbacks to the vector
+void player_t::enter_combat()
+{
+  if ( in_combat )
+    return;
+
+  in_combat = true;
+
+  sim->print_log( "{} enters combat.", *this );
+
+  for ( size_t i = 0; i < callbacks_on_combat_state.size(); ++i )
+    callbacks_on_combat_state[ i ]( this, in_combat );
+}
+
+void player_t::leave_combat()
+{
+  if ( !in_combat )
+    return;
+
+  in_combat = false;
+
+  sim->print_log( "{} leaves combat.", *this );
+
+  for ( size_t i = 0; i < callbacks_on_combat_state.size(); ++i )
+    callbacks_on_combat_state[ i ]( this, in_combat );
 }
 
 /**
@@ -7729,16 +7749,28 @@ void player_t::do_damage( action_state_t* incoming_state )
   // TODO: How to express action causing/not causing incoming callbacks?
   if ( incoming_state->action && incoming_state->action->callbacks )
   {
-    proc_types pt   = incoming_state->proc_type();
-    proc_types2 pt2 = incoming_state->execute_proc_type2();
-    // For incoming landed abilities, get the impact type for the proc.
-    // if ( pt2 == PROC2_LANDED )
-    //  pt2 = s -> impact_proc_type2();
+    proc_types pt = incoming_state->proc_type();
+    if ( pt != PROC1_INVALID )
+    {
+      // On damage/heal in. Proc flags are arranged as such that the "incoming"
+      // version of the primary proc flag is always follows the outgoing version...
+      proc_types pt_taken = static_cast<proc_types>( pt + 1 );
+      // ...except for PROC1_HELPFUL_PERIODIC_TAKEN
+      if ( pt == PROC1_HELPFUL_PERIODIC )
+        pt_taken = PROC1_HELPFUL_PERIODIC_TAKEN;
 
-    // On damage/heal in. Proc flags are arranged as such that the "incoming"
-    // version of the primary proc flag is always follows the outgoing version.
-    if ( pt != PROC1_INVALID && pt2 != PROC2_INVALID )
-      action_callback_t::trigger( callbacks.procs[ pt + 1 ][ pt2 ], incoming_state->action, incoming_state );
+      // Because most procs in simc default to using PROC2_LANDED for most proc types,
+      // trigger the execute_proc_type2() here to ensure that those procs will work.
+      proc_types2 execute_pt2 = incoming_state->execute_proc_type2();
+      if ( execute_pt2 != PROC2_INVALID )
+        trigger_callbacks( pt_taken, execute_pt2, incoming_state->action, incoming_state );
+
+      // Additionally, trigger the impact_proc_type2() so that periodic effects and
+      // procs not using execute proc types will also work.
+      proc_types2 impact_pt2 = incoming_state->impact_proc_type2();
+      if ( impact_pt2 != PROC2_INVALID )
+        trigger_callbacks( pt_taken, impact_pt2, incoming_state->action, incoming_state );
+    }
   }
 
   // Check if target is dying
@@ -7882,6 +7914,11 @@ void player_t::assess_heal( school_e, result_amount_type, action_state_t* s )
 
   // store iteration heal taken
   iteration_heal_taken += s->result_amount;
+}
+
+void player_t::trigger_callbacks( proc_types type, proc_types2 type2, action_t* action, action_state_t* state )
+{
+  action_callback_t::trigger( callbacks.procs[ type ][ type2 ], action, state );
 }
 
 void player_t::summon_pet( util::string_view pet_name, const timespan_t duration )
@@ -8382,6 +8419,9 @@ struct shadowmeld_t : public racial_spell_t
 
     // Shadowmeld stops autoattacks
     player->cancel_auto_attacks();
+
+    if ( !player->in_boss_encounter )
+      player->leave_combat();
   }
 };
 
@@ -9160,6 +9200,15 @@ struct use_item_t : public action_t
       // Create an action
       action = e->create_action();
 
+      // if the action is the same as the driver, has a direct/periodic damage effect, and the driver has a cast time,
+      // then the action is not considered a proc
+      if ( action && action->id == e->driver()->id() && e->driver()->cast_time() > 0_ms &&
+           ( action_t::has_direct_damage_effect( *e->driver() ) ||
+             action_t::has_periodic_damage_effect( *e->driver() ) ) )
+      {
+        action->not_a_proc = true;
+      }
+
       stats = player->get_stats( name_str, this );
 
       // Setup the long-duration cooldown for this item effect
@@ -9190,6 +9239,12 @@ struct use_item_t : public action_t
       }
     }
 
+    if ( action )
+    {
+      interrupt_auto_attack = action->interrupt_auto_attack;
+      reset_auto_attack = action->reset_auto_attack;
+    }
+
     if ( !buff && !action )
     {
       if ( sim->debug )
@@ -9202,6 +9257,14 @@ struct use_item_t : public action_t
     }
 
     action_t::init();
+  }
+
+  void init_finished() override
+  {
+    action_t::init_finished();
+
+    if ( action )
+      action->is_precombat = is_precombat;
   }
 
   timespan_t execute_time() const override
@@ -11130,6 +11193,9 @@ std::unique_ptr<expr_t> player_t::create_expression( util::string_view expressio
   if ( expression_str == "in_combat" )
     return make_ref_expr( "in_combat", in_combat );
 
+  if ( expression_str == "in_boss_encounter" )
+    return make_ref_expr( "in_boss_encounter", in_boss_encounter );
+
   if ( expression_str == "ptr" )
     return expr_t::create_constant( "ptr", dbc->ptr );
 
@@ -11484,6 +11550,18 @@ std::unique_ptr<expr_t> player_t::create_expression( util::string_view expressio
 
       throw std::invalid_argument( fmt::format( "Unsupported shadowlands. option '{}'.", splits[ 1 ] ) );
     }
+
+    if ( splits[ 0 ] == "dragonflight" )
+    {
+      if ( splits[ 1 ] == "screaming_black_dragonscale_damage" )
+      {
+        return make_fn_expr( expression_str, [this] {
+          return sim->dragonflight_opts.screaming_black_dragonscale_damage;
+        } );
+      }
+
+      throw std::invalid_argument( fmt::format( "Unsupported dragonflight. option '{}'.", splits[ 1 ] ) );
+    }
   } // splits.size() == 2
 
 
@@ -11495,7 +11573,7 @@ std::unique_ptr<expr_t> player_t::create_expression( util::string_view expressio
       get_target_data( this );
       buff_t* buff = buff_t::find_expressable( buff_list, splits[ 1 ], this );
       if ( !buff )
-        buff = buff_t::find( this, splits[ 1 ], this );  // Raid debuffs
+        buff = buff_t::find( this, splits[ 1 ], this );  // Raid debuffs & fallback buffs
       if ( buff )
         return buff_t::create_expression( splits[ 1 ], splits[ 2 ], *buff );
       throw std::invalid_argument(fmt::format("Cannot find buff '{}'.", splits[ 1 ]));
@@ -12069,20 +12147,26 @@ std::string player_t::create_profile( save_e stype )
       }
     }
 
-    if ( !shadowlands_opts.soleahs_secret_technique_type.empty() )
-    {
-      profile_str += "shadowlands.soleahs_secret_technique_type_override=" + shadowlands_opts.soleahs_secret_technique_type + term;
-    }
+    auto print_option = [ &profile_str, term ]( std::string_view n, auto option ) {
+      if ( !option.is_default() )
+      {
+        if constexpr ( std::is_same_v<decltype( option ), player_option_t<bool>> )
+          profile_str += fmt::format( "{}={}{}", n, static_cast<int>( option ), term );
+        else
+          profile_str += fmt::format( "{}={}{}", n, option, term );
+      }
+    };
 
-    if ( !dragonflight_opts.ruby_whelp_shell_training.empty() )
-    {
-      profile_str += "dragonflight.player.ruby_whelp_shell_training=" + dragonflight_opts.ruby_whelp_shell_training + term;
-    }
+    print_option( "shadowlands.soleahs_secret_technique_type_override", shadowlands_opts.soleahs_secret_technique_type );
 
-    if ( !dragonflight_opts.ruby_whelp_shell_context.empty() )
-    {
-      profile_str += "dragonflight.player.ruby_whelp_shell_context=" + dragonflight_opts.ruby_whelp_shell_context + term;
-    }
+    print_option( "dragonflight.gyroscopic_kaleidoscope_stat", dragonflight_opts.gyroscopic_kaleidoscope_stat );
+    print_option( "dragonflight.player.ruby_whelp_shell_training", dragonflight_opts.ruby_whelp_shell_training );
+    print_option( "dragonflight.player.ruby_whelp_shell_context", dragonflight_opts.ruby_whelp_shell_context );
+    print_option( "dragonflight.ominous_chromatic_essence_dragonflight", dragonflight_opts.ominous_chromatic_essence_dragonflight );
+    print_option( "dragonflight.ominous_chromatic_essence_allies", dragonflight_opts.ominous_chromatic_essence_allies );
+    print_option( "dragonflight.ashkandur_humanoid", dragonflight_opts.ashkandur_humanoid );
+    print_option( "dragonflight.flowstone_starting_state", dragonflight_opts.flowstone_starting_state );
+    print_option( "dragonflight.spoils_of_neltharus_initial_type", dragonflight_opts.spoils_of_neltharus_initial_type );
   }
 
   if ( stype & SAVE_PLAYER )
@@ -12614,6 +12698,7 @@ void player_t::create_options()
   };
 
   add_option( opt_external_buff_times( "external_buffs.power_infusion", external_buffs.power_infusion ) );
+  add_option( opt_external_buff_times( "external_buffs.symbol_of_hope", external_buffs.symbol_of_hope ) );
   add_option( opt_external_buff_times( "external_buffs.blessing_of_summer", external_buffs.blessing_of_summer ) );
   add_option( opt_external_buff_times( "external_buffs.blessing_of_autumn", external_buffs.blessing_of_autumn ) );
   add_option( opt_external_buff_times( "external_buffs.blessing_of_winter", external_buffs.blessing_of_winter ) );
@@ -12672,6 +12757,13 @@ void player_t::create_options()
   add_option( opt_string( "dragonflight.gyroscopic_kaleidoscope_stat", dragonflight_opts.gyroscopic_kaleidoscope_stat ) );
   add_option( opt_string( "dragonflight.player.ruby_whelp_shell_training", dragonflight_opts.ruby_whelp_shell_training ) );
   add_option( opt_string( "dragonflight.player.ruby_whelp_shell_context", dragonflight_opts.ruby_whelp_shell_context ) );
+  add_option( opt_string( "dragonflight.ominous_chromatic_essence_dragonflight", dragonflight_opts.ominous_chromatic_essence_dragonflight ) );
+  add_option( opt_string( "dragonflight.ominous_chromatic_essence_allies", dragonflight_opts.ominous_chromatic_essence_allies ) );
+  add_option( opt_bool( "dragonflight.ashkandur_humanoid", dragonflight_opts.ashkandur_humanoid ) );
+  add_option( opt_string( "dragonflight.flowstone_starting_state", dragonflight_opts.flowstone_starting_state ) );
+  add_option( opt_string( "dragonflight.spoils_of_neltharus_initial_type", dragonflight_opts.spoils_of_neltharus_initial_type ) );
+  add_option( opt_float( "dragonflight.igneous_flowstone_double_lava_wave_chance", dragonflight_opts.igneous_flowstone_double_lava_wave_chance ) );
+  add_option( opt_bool( "dragonflight.voice_of_the_silent_star_enable", dragonflight_opts.voice_of_the_silent_star_enable ) );
 
   // Obsolete options
 
@@ -14359,6 +14451,11 @@ void player_t::register_on_arise_callback( player_t* source, std::function<void(
 void player_t::register_on_kill_callback( std::function<void( player_t* )> fn )
 {
   callbacks_on_kill.emplace_back( std::move( fn ) );
+}
+
+void player_t::register_on_combat_state_callback( std::function<void( player_t*, bool )> fn )
+{
+  callbacks_on_combat_state.emplace_back( std::move( fn ) );
 }
 
 spawner::base_actor_spawner_t* player_t::find_spawner( util::string_view id ) const

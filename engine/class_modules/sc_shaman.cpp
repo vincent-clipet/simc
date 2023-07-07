@@ -223,6 +223,11 @@ using spell_totem_pet_t = shaman_totem_pet_t<spell_t>;
 using heal_totem_action_t = totem_pulse_action_t<heal_t>;
 using heal_totem_pet_t = shaman_totem_pet_t<heal_t>;
 
+namespace pet
+{
+struct base_wolf_t;
+}
+
 struct shaman_td_t : public actor_target_data_t
 {
   struct dots
@@ -259,6 +264,7 @@ struct shaman_t : public player_t
 public:
   // Misc
   bool lava_surge_during_lvb;
+  bool sk_during_cast;
   /// Shaman ability cooldowns
   std::vector<cooldown_t*> ability_cooldowns;
   player_t* recent_target =
@@ -279,14 +285,15 @@ public:
   unsigned max_active_flame_shock;
 
   /// Maelstrom Weapon blocklist, allowlist; (spell_id, { override_state, proc tracking object })
-  std::vector<std::pair<mw_proc_state, proc_t*>> mw_proc_state_list;
+  std::vector<mw_proc_state> mw_proc_state_list;
 
   /// Maelstrom generator/spender tracking
   std::vector<std::pair<simple_sample_data_t, simple_sample_data_t>> mw_source_list;
-  std::vector<simple_sample_data_t> mw_spend_list;
+  std::vector<std::array<simple_sample_data_t, 11>> mw_spend_list;
 
   /// Deeply Rooted Elements tracking
   extended_sample_data_t dre_samples;
+  extended_sample_data_t dre_uptime_samples;
   unsigned dre_attempts;
 
   // Cached actions
@@ -325,15 +332,17 @@ public:
     pet_t* guardian_storm_elemental;
     pet_t* guardian_earth_elemental;
 
-    spawner::pet_spawner_t<pet_t, shaman_t> spirit_wolves;
-    spawner::pet_spawner_t<pet_t, shaman_t> fire_wolves;
-    spawner::pet_spawner_t<pet_t, shaman_t> frost_wolves;
-    spawner::pet_spawner_t<pet_t, shaman_t> lightning_wolves;
+    spawner::pet_spawner_t<pet::base_wolf_t, shaman_t> spirit_wolves;
+    spawner::pet_spawner_t<pet::base_wolf_t, shaman_t> fire_wolves;
+    spawner::pet_spawner_t<pet::base_wolf_t, shaman_t> frost_wolves;
+    spawner::pet_spawner_t<pet::base_wolf_t, shaman_t> lightning_wolves;
 
     // TODO: Proper dynamic-number-of-totems-spawned system, some day
     std::array<pet_t*, 2> liquid_magma_totem;
     std::array<pet_t*, 2> healing_stream_totem;
     std::array<pet_t*, 2> capacitor_totem;
+
+    std::vector<pet::base_wolf_t*> all_wolves;
 
     pets_t( shaman_t* );
   } pet;
@@ -437,6 +446,7 @@ public:
   {
     rotation_type_e rotation = ROTATION_STANDARD;
     int dre_flat_chance = -1;
+    unsigned dre_forced_failures = 2U;
   } options;
 
   // Cooldowns
@@ -515,17 +525,10 @@ public:
 
     // Enhancement
     proc_t* hot_hand;
-    proc_t* maelstrom_weapon_fs;
-    proc_t* maelstrom_weapon_ea;
-    proc_t* maelstrom_weapon_sm;
-    proc_t* maelstrom_weapon_pw;
-    proc_t* maelstrom_weapon_sa;
-    proc_t* maelstrom_weapon_sa_rf;
-    proc_t* maelstrom_weapon_4pc_enh;
     proc_t* stormflurry;
     proc_t* windfury_uw;
     proc_t* t28_4pc_enh;
-    proc_t* munched_lotf;
+    proc_t* reset_swing_mw;
   } proc;
 
   // Class Specializations
@@ -662,7 +665,6 @@ public:
     // Row 7
     player_talent_t stormblast;
     player_talent_t converging_storms;
-    player_talent_t chain_lightning2;
     player_talent_t hot_hand;
     player_talent_t swirling_maelstrom;
     player_talent_t lashing_flames;
@@ -768,9 +770,11 @@ public:
   shaman_t( sim_t* sim, util::string_view name, race_e r = RACE_TAUREN )
     : player_t( sim, SHAMAN, name, r ),
       lava_surge_during_lvb( false ),
+      sk_during_cast(false),
       lotfw_counter( 0U ),
       raptor_glyph( false ),
       dre_samples( "dre_tracker", false ),
+      dre_uptime_samples( "dre_uptime_tracker", false ),
       dre_attempts( 0U ),
       action(),
       pet( this ),
@@ -821,6 +825,7 @@ public:
       resource_regeneration = regen_type::DYNAMIC;
 
     dre_samples.reserve( 8192 );
+    dre_uptime_samples.reserve( 8192 );
   }
 
   ~shaman_t() override = default;
@@ -834,12 +839,11 @@ public:
   timespan_t last_t30_proc;
   bool t30_proc_possible;
 
-  std::pair<mw_proc_state, proc_t*>& set_mw_proc_state( action_t* action, mw_proc_state state )
+  mw_proc_state set_mw_proc_state( action_t* action, mw_proc_state state )
   {
     if ( as<unsigned>( action->internal_id ) >= mw_proc_state_list.size() )
     {
-      mw_proc_state_list.resize( action->internal_id + 1U,
-                                 { mw_proc_state::DEFAULT, nullptr } );
+      mw_proc_state_list.resize( action->internal_id + 1U, mw_proc_state::DEFAULT );
     }
 
     // Use explicit mw_proc_state::DEFAULT set as initialization in shaman_t::action_init_finished
@@ -848,21 +852,12 @@ public:
       return mw_proc_state_list[ action->internal_id ];
     }
 
-    mw_proc_state_list[ action->internal_id ].first = state;
-    if ( state == mw_proc_state::ENABLED &&
-         !mw_proc_state_list[ action->internal_id ].second )
-    {
-      mw_proc_state_list[ action->internal_id ].second = get_proc(
-          fmt::format( "Maelstrom Weapon: {}",
-                      action->data().id()
-                      ? action->data().name_cstr()
-                      : action->name_str ) );
-    }
+    mw_proc_state_list[ action->internal_id ] = state;
 
     return mw_proc_state_list[ action->internal_id ];
   }
 
-  std::pair<mw_proc_state, proc_t*>& set_mw_proc_state( action_t& action, mw_proc_state state )
+  mw_proc_state set_mw_proc_state( action_t& action, mw_proc_state state )
   { return set_mw_proc_state( &( action ), state ); }
 
   mw_proc_state get_mw_proc_state( action_t* action ) const
@@ -870,22 +865,11 @@ public:
     assert( as<unsigned>( action->internal_id ) < mw_proc_state_list.size() &&
             "No Maelstrom Weapon proc-state found" );
 
-    return mw_proc_state_list[ action->internal_id ].first;
+    return mw_proc_state_list[ action->internal_id ];
   }
 
   mw_proc_state get_mw_proc_state( action_t& action ) const
   { return get_mw_proc_state( &( action ) ); }
-
-  proc_t* get_mw_proc_state_counter( action_t* action ) const
-  {
-    assert( as<unsigned>( action->internal_id ) < mw_proc_state_list.size() &&
-            "No Maelstrom Weapon proc-state found" );
-
-    return mw_proc_state_list[ action->internal_id ].second;
-  }
-
-  proc_t* get_mw_proc_state_counter( action_t& action ) const
-  { return get_mw_proc_state_counter( &( action ) ); }
 
   // trackers, big code blocks that shall not be doublicated
   void track_magma_chamber();
@@ -932,6 +916,7 @@ public:
   void create_special_effects() override;
   void action_init_finished( action_t& action ) override;
   void analyze( sim_t& sim ) override;
+  void datacollection_end() override;
 
   // APL releated methods
   void init_action_list() override;
@@ -1037,7 +1022,7 @@ struct maelstrom_weapon_buff_t : public buff_t
   maelstrom_weapon_buff_t( shaman_t* p ) :
     buff_t( p, "maelstrom_weapon", p->find_spell( 344179 ) ), shaman( p )
   {
-    set_max_stack( data().max_stacks() + p->talent.raging_maelstrom->effectN( 1 ).base_value() );
+    set_max_stack( data().max_stacks() + as<int>( p->talent.raging_maelstrom->effectN( 1 ).base_value() ) );
   }
 
   void increment( int stacks, double value, timespan_t duration ) override
@@ -1111,7 +1096,7 @@ struct cl_crash_lightning_buff_t : public buff_t
     int max_stack = data().max_stacks(); 
     if (p->talent.crashing_storms->ok())
     {
-      max_stack += p->talent.crashing_storms.spell()->effectN( 3 ).base_value();
+      max_stack += as<int>( p->talent.crashing_storms.spell()->effectN( 3 ).base_value() );
     }
 
     set_max_stack( max_stack );
@@ -1235,6 +1220,9 @@ public:
   bool affected_by_enh_t30_4pc_da;
   bool affected_by_enh_t30_4pc_ta;
 
+  bool affected_by_stormkeeper_cast_time;
+  bool affected_by_stormkeeper_damage;
+
   shaman_action_t( util::string_view n, shaman_t* player, const spell_data_t* s = spell_data_t::nil(),
                   execute_type type_ = execute_type::NORMAL )
     : ab( n, player, s ),
@@ -1259,7 +1247,9 @@ public:
       affected_by_lotfw_da( false ),
       affected_by_lotfw_ta( false ),
       affected_by_enh_t30_4pc_da( false ),
-      affected_by_enh_t30_4pc_ta( false )
+      affected_by_enh_t30_4pc_ta( false ),
+      affected_by_stormkeeper_cast_time( false ),
+      affected_by_stormkeeper_damage( false )
   {
     ab::may_crit = true;
     ab::track_cd_waste = s->cooldown() > timespan_t::zero() || s->charge_cooldown() > timespan_t::zero();
@@ -1276,7 +1266,10 @@ public:
       maelstrom_gain    = effect.resource( RESOURCE_MAELSTROM );
       ab::energize_type = action_energize::NONE;  // disable resource generation from spell data.
     }
-
+    affected_by_stormkeeper_cast_time = 
+        ab::data().affected_by( player->find_spell( 191634 )->effectN( 1 ) );
+    affected_by_stormkeeper_damage    =
+        ab::data().affected_by( player->find_spell( 191634 )->effectN( 2 ) );
     affected_by_molten_weapon_da =
         ab::data().affected_by( player->find_spell( 224125 )->effectN( 1 ) );
     affected_by_molten_weapon_ta =
@@ -1591,7 +1584,7 @@ public:
       p()->buff.flurry->trigger( p()->buff.flurry->max_stack() );
     }
 
-    if ( affected_by_ns_cast_time || affected_by_ns_cost )
+    if ( ( affected_by_ns_cast_time || affected_by_ns_cost ) && !(affected_by_stormkeeper_cast_time && p()->buff.stormkeeper->up()))
     {
       p()->buff.natures_swiftness->decrement();
     }
@@ -1869,6 +1862,11 @@ public:
   // a spell to spell level
   virtual bool consume_maelstrom_weapon() const
   {
+    if ( this->exec_type == execute_type::THORIMS_INVOCATION )
+    {
+      return true;
+    }
+
     return benefit_from_maelstrom_weapon() && !this->background;
   }
 
@@ -1879,7 +1877,15 @@ public:
       return 0;
     }
 
-    return std::min( mw_consume_max_stack, this->p()->buff.maelstrom_weapon->check() );
+    auto mw_stacks = std::min( mw_consume_max_stack, this->p()->buff.maelstrom_weapon->check() );
+
+    if ( this->exec_type == execute_type::THORIMS_INVOCATION )
+    {
+      mw_stacks = std::min( mw_stacks,
+                            as<int>( this->p()->talent.thorims_invocation->effectN( 1 ).base_value() ) );
+    }
+
+    return mw_stacks;
   }
 
   timespan_t execute_time() const override
@@ -1911,13 +1917,18 @@ public:
 
   void compute_mw_multiplier()
   {
+    if ( !this->p()->talent.maelstrom_weapon.ok() || !affected_by_maelstrom_weapon )
+    {
+      return;
+    }
+
     mw_multiplier = 0.0;
     mw_affected_stacks = maelstrom_weapon_stacks();
     mw_consumed_stacks = consume_maelstrom_weapon() ? mw_affected_stacks : 0;
 
     if ( mw_affected_stacks && affected_by_maelstrom_weapon )
     {
-      double stack_value = this->p()->talent.improved_maelstrom_weapon->effectN( 2 ).percent() +
+      double stack_value = this->p()->talent.improved_maelstrom_weapon->effectN( 1 ).percent() +
                            this->p()->talent.raging_maelstrom->effectN( 2 ).percent();
 
       mw_multiplier = stack_value * mw_affected_stacks;
@@ -1943,18 +1954,20 @@ public:
 
     // Main hand swing timer resets if the MW-affected spell is not instant cast
     // Need to check this before spending the MW or autos will be lost.
-    if ( affected_by_maelstrom_weapon && execute_time() > 0_ms )
+    if ( affected_by_maelstrom_weapon && mw_consumed_stacks < 5 )
     {
-      if ( this->p()->main_hand_attack && this->p()->main_hand_attack->execute_event )
+      if ( this->p()->main_hand_attack && this->p()->main_hand_attack->execute_event &&
+           ( this->p()->bugs || !this->background ) )
       {
+        if ( this->sim->debug )
+        {
+          this->sim->out_debug.print( "{} resetting {} due to MW spell cast of {}",
+                                     this->p()->name(), this->p()->main_hand_attack->name(),
+                                     this->name() );
+        }
         event_t::cancel( this->p()->main_hand_attack->execute_event );
         this->p()->main_hand_attack->schedule_execute();
-      }
-
-      if ( this->p()->off_hand_attack && this->p()->off_hand_attack->execute_event )
-      {
-        event_t::cancel( this->p()->off_hand_attack->execute_event );
-        this->p()->off_hand_attack->schedule_execute();
+        this->p()->proc.reset_swing_mw->occur();
       }
     }
 
@@ -2013,15 +2026,11 @@ struct shaman_spell_t : public shaman_spell_base_t<spell_t>
   proc_t* proc_sb;
   bool affected_by_master_of_the_elements = false;
   proc_t* proc_moe;
-  bool affected_by_stormkeeper_cast_time  = false;
-  bool affected_by_stormkeeper_damage     = false;
 
   shaman_spell_t( util::string_view token, shaman_t* p, const spell_data_t* s = spell_data_t::nil(),
                  execute_type type_ = execute_type::NORMAL ) :
     base_t( token, p, s, type_ ), overload( nullptr ), proc_sb( nullptr ), proc_moe( nullptr )
   {
-    affected_by_stormkeeper_cast_time = data().affected_by( p->find_spell( 191634 )->effectN( 1 ) );
-    affected_by_stormkeeper_damage = data().affected_by( p->find_spell( 191634 )->effectN( 2 ) );
 
     may_proc_stormbringer = false;
   }
@@ -2050,7 +2059,7 @@ struct shaman_spell_t : public shaman_spell_base_t<spell_t>
       m *= 1.0 + p()->buff.master_of_the_elements->value();
     }
 
-    if ( affected_by_stormkeeper_damage && p()->buff.stormkeeper->up() )
+    if ( affected_by_stormkeeper_damage && p()->buff.stormkeeper->up() && !p()->sk_during_cast )
     {
       m *= 1.0 + p()->buff.stormkeeper->value();
     }
@@ -2062,7 +2071,7 @@ struct shaman_spell_t : public shaman_spell_base_t<spell_t>
   {
     timespan_t t = base_t::execute_time();
 
-    if ( affected_by_stormkeeper_cast_time && p()->buff.stormkeeper->up() )
+    if ( affected_by_stormkeeper_cast_time && p()->buff.stormkeeper->up() && !p()->sk_during_cast )
     {
       // stormkeeper has a -100% value as effect 1
       t *= 1.0 + p()->buff.stormkeeper->data().effectN( 1 ).percent();
@@ -2109,7 +2118,7 @@ struct shaman_spell_t : public shaman_spell_base_t<spell_t>
 
     // Add excessive amount to ensure overload proc with SK,
     // since chain spells divide chance by X
-    if ( affected_by_stormkeeper_cast_time && p()->buff.stormkeeper->check() )
+    if ( affected_by_stormkeeper_cast_time && p()->buff.stormkeeper->check() && !p()->sk_during_cast )
     {
       chance += 10.0;
     }
@@ -2563,7 +2572,7 @@ template <typename T>
 struct spirit_bomb_t : public pet_melee_attack_t<T>
 {
   spirit_bomb_t( T* player ) :
-    pet_melee_attack_t<T>( player, "spirit_bomb", player -> find_spell( 198455 ) )
+    pet_melee_attack_t<T>( player, player->dbc->ptr ? "alpha_wolf" : "spirit_bomb", player -> find_spell( 198455 ) )
   {
     this -> background = true;
     this -> aoe = -1;
@@ -3922,9 +3931,7 @@ struct stormstrike_base_t : public shaman_attack_t
     {
       make_event( sim, 0_s, [ this ]() {
         p()->generate_maelstrom_weapon( execute_state,
-          p()->talent.elemental_assault->effectN( 2 ).base_value() );
-          //p()->buff.maelstrom_weapon->trigger( p()->talent.elemental_assault->effectN( 2 ).base_value() );
-        p()->proc.maelstrom_weapon_ea->occur();
+                                        as<int>( p()->talent.elemental_assault->effectN( 2 ).base_value() ) );
       } );
     }
 
@@ -4091,13 +4098,28 @@ struct sundering_t : public shaman_attack_t
     may_proc_stormbringer = may_proc_flametongue = true;
   }
 
+  double action_da_multiplier() const override
+  {
+    double m = shaman_attack_t::action_da_multiplier();
+
+    // In-Game, Sundering damage double dips on T30 4PC damage buff
+    if ( player->bugs )
+    {
+      m *= 1.0 + p()->buff.t30_4pc_enh_damage->value();
+    }
+
+    return m;
+  }
+
   void execute() override
   {
+    // In-game, Sundering that procs T30 4PC already benefits from the T30 damage buff
+    p()->buff.t30_4pc_enh_damage->trigger();
+    p()->buff.t30_4pc_enh_cl->trigger( p()->buff.t30_4pc_enh_cl->data().max_stacks() );
+
     shaman_attack_t::execute();
 
     p()->buff.t30_2pc_enh->trigger();
-    p()->buff.t30_4pc_enh_damage->trigger();
-    p()->buff.t30_4pc_enh_cl->trigger( p()->buff.t30_4pc_enh_cl->data().max_stacks() );
   }
 };
 
@@ -4333,7 +4355,8 @@ struct fire_elemental_t : public shaman_spell_t
     : shaman_spell_t( "fire_elemental", player, player->talent.fire_elemental )
   {
     parse_options( options_str );
-    harmful = may_crit = false;
+    harmful  = true;
+    may_crit = false;
   }
 
   void execute() override
@@ -4363,7 +4386,8 @@ struct storm_elemental_t : public shaman_spell_t
     : shaman_spell_t( "storm_elemental", player, player->talent.storm_elemental )
   {
     parse_options( options_str );
-    harmful = may_crit = false;
+    harmful  = true;
+    may_crit = false;
   }
 
   void execute() override
@@ -4497,7 +4521,7 @@ struct chained_overload_base_t : public elemental_overload_spell_t
 
     if ( p()->buff.t30_4pc_ele->up() )
     {
-      cm += p()->spell.t30_4pc_ele->effectN( 2 ).percent();
+      cm *= (1.0 + p()->spell.t30_4pc_ele->effectN( 2 ).percent());
     }
 
     return cm;
@@ -4520,7 +4544,7 @@ struct chain_lightning_overload_t : public chained_overload_base_t
 
     if ( p()->buff.surge_of_power->up() )
     {
-      t += p()->talent.surge_of_power->effectN( 4 ).base_value();
+      t += as<int>( p()->talent.surge_of_power->effectN( 4 ).base_value() );
     }
 
     return t;
@@ -4556,7 +4580,7 @@ struct lava_beam_overload_t : public chained_overload_base_t
 
     if ( p()->buff.surge_of_power->up() )
     {
-      t += p()->talent.surge_of_power->effectN( 4 ).base_value();
+      t += as<int>( p()->talent.surge_of_power->effectN( 4 ).base_value() );
     }
 
     return t;
@@ -4615,7 +4639,11 @@ struct chained_base_t : public shaman_spell_t
       {
         p()->buff.t30_4pc_ele->trigger();
       }
-      p()->buff.stormkeeper->decrement();
+      if ( !p()->sk_during_cast )
+      {
+        p()->buff.stormkeeper->decrement();
+      }
+      p()->sk_during_cast = false;
     }
 
     p()->trigger_static_accumulation_refund( execute_state, mw_consumed_stacks );
@@ -4627,7 +4655,7 @@ struct chained_base_t : public shaman_spell_t
 
     if ( p()->buff.t30_4pc_ele->up() )
     {
-      cm += p()->spell.t30_4pc_ele->effectN( 2 ).percent();
+      cm *= ( 1.0 + p()->spell.t30_4pc_ele->effectN( 2 ).percent() );
     }
 
     return cm;
@@ -4746,7 +4774,7 @@ struct chain_lightning_t : public chained_base_t
 
     if ( p()->buff.surge_of_power->up() )
     {
-      t += p()->talent.surge_of_power->effectN( 4 ).base_value();
+      t += as<int>( p()->talent.surge_of_power->effectN( 4 ).base_value() );
     }
 
     return t;
@@ -4798,16 +4826,16 @@ struct chain_lightning_t : public chained_base_t
       p()->buff.cl_crash_lightning->trigger( num_targets_hit );
     }
 
-    if ( p()->talent.chain_lightning2->ok() )
+    if ( p()->talent.crash_lightning.ok() )
     {
       p()->cooldown.crash_lightning->adjust(
-          -( p()->talent.chain_lightning2->effectN( 1 ).time_value() * num_targets_hit ) );
+          -( p()->talent.chain_lightning->effectN( 3 ).time_value() * num_targets_hit ) );
 
       if ( sim->debug )
       {
         sim->print_debug( "{} reducing Crash Lightning cooldown by {}, remains={}",
             p()->name(),
-            -( p()->talent.chain_lightning2->effectN( 1 ).time_value() * num_targets_hit ),
+            -( p()->talent.chain_lightning->effectN( 3 ).time_value() * num_targets_hit ),
             p()->cooldown.crash_lightning->remains() );
       }
     }
@@ -4832,12 +4860,11 @@ struct chain_lightning_t : public chained_base_t
         std::ceil( mw_consumed_stacks * p()->buff.t30_4pc_enh_cl->data().effectN( 3 ).percent() ) );
 
       p()->generate_maelstrom_weapon( execute_state, refunded );
-      //p()->buff.maelstrom_weapon->trigger( refunded );
-      for ( auto i = 0; i < refunded; ++i )
+      // In-game, 0 stack Chain Lightning casts don't consume T30 4PC buff
+      if ( !p()->bugs || refunded > 0 )
       {
-        p()->proc.maelstrom_weapon_4pc_enh->occur();
+        p()->buff.t30_4pc_enh_cl->decrement();
       }
-      p()->buff.t30_4pc_enh_cl->decrement();
     }
 
     p()->buff.t29_2pc_ele->trigger();
@@ -4897,7 +4924,7 @@ struct lava_beam_t : public chained_base_t
 
     if ( p()->buff.surge_of_power->up() )
     {
-      t += p()->talent.surge_of_power->effectN( 4 ).base_value();
+      t += as<int>( p()->talent.surge_of_power->effectN( 4 ).base_value() );
     }
 
     return t;
@@ -5244,6 +5271,19 @@ struct fire_nova_explosion_t : public shaman_spell_t
   {
     background = true;
   }
+
+  double action_da_multiplier() const override
+  {
+    double m = shaman_spell_t::action_da_multiplier();
+
+    // In-game, Fire Nova damage double-dips on T30 4PC buff
+    if ( player->bugs )
+    {
+      m *= 1.0 + p()->buff.t30_4pc_enh_damage->value();
+    }
+
+    return m;
+  }
 };
 
 struct fire_nova_t : public shaman_spell_t
@@ -5427,12 +5467,6 @@ struct lava_burst_t : public shaman_spell_t
       if ( p()->buff.windspeakers_lava_resurgence->up() ) {
         p()->buff.windspeakers_lava_resurgence->decrement();
       }
-    }
-
-    // Rolls on execute and on impact
-    if ( rng().roll( p()->talent.power_of_the_maelstrom->effectN( 2 ).percent() ) )
-    {
-      p()->buff.power_of_the_maelstrom->trigger();
     }
   }
 
@@ -5698,29 +5732,6 @@ struct lightning_bolt_t : public shaman_spell_t
     }
   }
 
-  bool consume_maelstrom_weapon() const override
-  {
-    if ( exec_type == execute_type::THORIMS_INVOCATION )
-    {
-      return true;
-    }
-
-    return shaman_spell_t::consume_maelstrom_weapon();
-  }
-
-  int maelstrom_weapon_stacks() const override
-  {
-    auto mw_stacks = shaman_spell_t::maelstrom_weapon_stacks();
-
-    if ( exec_type == execute_type::THORIMS_INVOCATION )
-    {
-      mw_stacks = std::min( mw_stacks,
-                            as<int>( p()->talent.thorims_invocation->effectN( 1 ).base_value() ) );
-    }
-
-    return mw_stacks;
-  }
-
   size_t available_targets( std::vector<player_t*>& tl ) const override
   {
     shaman_spell_t::available_targets( tl );
@@ -5804,11 +5815,16 @@ struct lightning_bolt_t : public shaman_spell_t
     if ( exec_type == execute_type::NORMAL &&
          p()->specialization() == SHAMAN_ELEMENTAL )
     {
-      if ( p()->sets->has_set_bonus( SHAMAN_ELEMENTAL, T30, B4 ) && p()->buff.stormkeeper->stack() == 1 )
+
+      if ( !p()->sk_during_cast )
       {
-        p()->buff.t30_4pc_ele->trigger();
+        if ( p()->sets->has_set_bonus( SHAMAN_ELEMENTAL, T30, B4 ) && p()->buff.stormkeeper->stack() == 1 )
+        {
+          p()->buff.t30_4pc_ele->trigger();
+        }
+        p()->buff.stormkeeper->decrement();
       }
-      p()->buff.stormkeeper->decrement();
+      p()->sk_during_cast = false;
     }
 
     p()->trigger_flash_of_lightning();
@@ -5975,7 +5991,7 @@ struct elemental_blast_t : public shaman_spell_t
     {
       if ( player->talent.elemental_blast.ok() && player->talent.lava_burst.ok() )
       {
-        cooldown->charges += player->find_spell( 394152 )->effectN( 2 ).base_value();
+        cooldown->charges += as<int>( player->find_spell( 394152 )->effectN( 2 ).base_value() );
       }
     }
   }
@@ -6119,7 +6135,7 @@ struct feral_spirit_spell_t : public shaman_spell_t
     shaman_spell_t( "feral_spirit", player, player->talent.feral_spirit )
   {
     parse_options( options_str );
-    harmful = false;
+    harmful = true;
 
     // Cache pointer for MW tracking uses
     p()->action.feral_spirits = this;
@@ -6222,7 +6238,7 @@ struct earthquake_damage_base_t : public shaman_spell_t
 
     if ( p()->buff.t30_4pc_ele->up() )
     {
-      cm += p()->spell.t30_4pc_ele->effectN( 2 ).percent();
+      cm *= ( 1.0 + p()->spell.t30_4pc_ele->effectN( 2 ).percent() );
     }
 
     return cm;
@@ -6286,7 +6302,7 @@ struct earthquake_overload_damage_t : public earthquake_damage_base_t
     earthquake_damage_base_t( player, "earthquake_overload_damage", player->find_spell( 298765 ), parent )
   {
     // Earthquake modifier is hardcoded rather than using effects, so we set the modifier here
-    spell_power_mod.direct = 0.1936 * player->talent.mountains_will_fall->effectN( 1 ).percent();
+    spell_power_mod.direct = 0.213 * player->talent.mountains_will_fall->effectN( 1 ).percent();
   }
 };
 
@@ -6320,7 +6336,7 @@ struct earthquake_damage_t : public earthquake_damage_base_t
     earthquake_damage_base_t( player, "earthquake_damage", player->find_spell( 77478 ), parent )
   {
     // Earthquake modifier is hardcoded rather than using effects, so we set the modifier here
-    spell_power_mod.direct = 0.1936;
+    spell_power_mod.direct = 0.213;
   }
 };
 
@@ -6751,6 +6767,8 @@ public:
   {
     parse_options( options_str );
 
+    affected_by_master_of_the_elements = true;
+
     // Ensure Flame Shock is single target, since Simulationcraft naively interprets a
     // Max Targets value on a spell to mean "aoe this many targets"
     aoe = 0;
@@ -6886,6 +6904,8 @@ public:
     {
       shaman_td_t* source_td = td( target );
       player_t* additional_target = nullptr;
+
+      spreader->set_target( state->target );
       // If all targets have flame shock, pick the shortest remaining time
       if ( player->get_active_dots( source_td->dot.flame_shock->current_action->internal_id ) ==
            sim->target_non_sleeping_list.size() )
@@ -6956,7 +6976,10 @@ struct frost_shock_t : public shaman_spell_t
 
     if ( p() ->buff.icefury->up() && p()->talent.electrified_shocks->ok() )
     {
-      t += p()->talent.electrified_shocks->effectN( 1 ).base_value();
+      // It looks like Frost Shock does not have the expected 1 baseline n_targets.
+      // Spell data suggests Electrified Shocks adds 3 targets.
+      // But the baseline target needs to be added, too.
+      t += 1 + as<int>( p()->talent.electrified_shocks->effectN( 1 ).base_value() );
     }
 
     return t;
@@ -7166,7 +7189,7 @@ struct ascendance_t : public shaman_spell_t
           auto new_duration = max_duration < fs_dot->remains()
                               ? -( fs_dot->remains() - max_duration )
                               : max_duration - fs_dot->remains();
-          fs_dot->adjust_duration( new_duration, -1 );
+          fs_dot->adjust_duration( new_duration, timespan_t::min(), -1, true );
         }
       } );
     }
@@ -7281,20 +7304,29 @@ struct stormkeeper_t : public shaman_spell_t
 
 // Doom Winds Spell ===========================================================
 
-struct doom_winds_t : public shaman_spell_t
+struct doom_winds_t : public shaman_attack_t
 {
   doom_winds_t( shaman_t* player, util::string_view options_str ) :
-    shaman_spell_t( "doom_winds", player, player->talent.doom_winds )
+    shaman_attack_t( "doom_winds", player, player->talent.doom_winds )
   {
     parse_options( options_str );
-    may_crit = harmful = false;
+
+    weapon = &( player->main_hand_weapon );
+    weapon_multiplier = 0.0;
+  }
+
+  void init() override
+  {
+    shaman_attack_t::init();
+
+    may_proc_stormbringer = false;
   }
 
   void execute() override
   {
-    shaman_spell_t::execute();
-
     p()->buff.doom_winds->trigger();
+
+    shaman_attack_t::execute();
   }
 };
 
@@ -8100,12 +8132,7 @@ struct primordial_wave_t : public shaman_spell_t
     if ( p()->talent.primal_maelstrom.ok() )
     {
       p()->generate_maelstrom_weapon( execute_state,
-                                    p()->talent.primal_maelstrom->effectN( 1 ).base_value() );
-      //p()->buff.maelstrom_weapon->trigger( p()->talent.primal_maelstrom->effectN( 1 ).base_value() );
-      for ( auto i = 0; i < p()->talent.primal_maelstrom->effectN( 1 ).base_value(); ++i )
-      {
-        p()->proc.maelstrom_weapon_pw->occur();
-      }
+                                      as<int>( p()->talent.primal_maelstrom->effectN( 1 ).base_value() ) );
     }
 
     if ( p()->talent.primordial_surge.ok() )
@@ -8149,6 +8176,12 @@ void ascendance_buff_t::ascendance( attack_t* mh, attack_t* oh )
       event_t::cancel( player->main_hand_attack->execute_event );
     }
 
+    if ( sim->debug )
+    {
+      sim->out_debug.print( "{} ascendance swing timer for main-hand, executing={}, time_to_hit={}",
+                            player->name(), executing, time_to_hit );
+    }
+
     player->main_hand_attack = mh;
     if ( executing )
     {
@@ -8186,6 +8219,12 @@ void ascendance_buff_t::ascendance( attack_t* mh, attack_t* oh )
         event_t::cancel( player->off_hand_attack->execute_event );
       }
 
+      if ( sim->debug )
+      {
+        sim->out_debug.print( "{} ascendance swing timer for off-hand, executing={}, time_to_hit={}",
+                              player->name(), executing, time_to_hit );
+      }
+
       player->off_hand_attack = oh;
       if ( executing )
       {
@@ -8198,7 +8237,7 @@ void ascendance_buff_t::ascendance( attack_t* mh, attack_t* oh )
         player->off_hand_attack->base_execute_time = timespan_t::zero();
         player->off_hand_attack->schedule_execute();
         player->off_hand_attack->base_execute_time = player->off_hand_attack->weapon->swing_time;
-        if ( player->off_hand_attack->execute_action )
+        if ( player->off_hand_attack->execute_event )
         {
           player->off_hand_attack->execute_event->reschedule( time_to_hit );
         }
@@ -8492,6 +8531,13 @@ std::unique_ptr<expr_t> shaman_t::create_expression( util::string_view name )
     } );
   }
 
+  if ( util::str_compare_ci( name, "dre_chance_pct" ) )
+  {
+    return make_fn_expr( name, [ this ]() {
+      return 100.0 * std::max( 0.0, dre_attempts * 0.01 - 0.01 * options.dre_forced_failures );
+    } );
+  }
+
   auto splits = util::string_split<util::string_view>( name, "." );
 
   if ( splits.size() >= 3 && util::str_compare_ci( splits[ 0 ], "pet" ) )
@@ -8551,11 +8597,12 @@ std::unique_ptr<expr_t> shaman_t::create_expression( util::string_view name )
 
   if ( util::str_compare_ci( splits[ 0 ], "feral_spirit" ) )
   {
-    if ( talent.elemental_spirits->ok() && !find_action( "feral_spirit" ) )
+    if ( !talent.feral_spirit.ok() )
     {
-      return expr_t::create_constant( name, 0 );
+      return expr_t::create_constant( splits[ 0 ], 0 );
     }
-    else if ( !talent.elemental_spirits->ok() && !find_action( "feral_spirit" ) )
+
+    if ( ( talent.feral_spirit.ok() || talent.elemental_spirits->ok() ) && !find_action( "feral_spirit" ) )
     {
       return expr_t::create_constant( name, 0 );
     }
@@ -8563,15 +8610,7 @@ std::unique_ptr<expr_t> shaman_t::create_expression( util::string_view name )
     if ( util::str_compare_ci( splits[ 1 ], "active" ) )
     {
       return make_fn_expr( name, [ this ]() {
-        if ( talent.elemental_spirits->ok() )
-        {
-          return pet.fire_wolves.n_active_pets() + pet.frost_wolves.n_active_pets() +
-                 pet.lightning_wolves.n_active_pets();
-        }
-        else
-        {
-          return pet.spirit_wolves.n_active_pets();
-        }
+        return as<double>( pet.all_wolves.size() );
       } );
     }
     else if ( util::str_compare_ci( splits[ 1 ], "remains" ) )
@@ -8596,38 +8635,13 @@ std::unique_ptr<expr_t> shaman_t::create_expression( util::string_view name )
       };
 
       return make_fn_expr( name, [ this, &max_remains_fn ]() {
-        if ( talent.elemental_spirits->ok() )
-        {
-          std::vector<pet_t*> max_remains;
-
-          if ( auto p = pet.fire_wolves.active_pet_max_remains() )
-          {
-            max_remains.push_back( p );
-          }
-
-          if ( auto p = pet.frost_wolves.active_pet_max_remains() )
-          {
-            max_remains.push_back( p );
-          }
-
-          if ( auto p = pet.lightning_wolves.active_pet_max_remains() )
-          {
-            max_remains.push_back( p );
-          }
-
-          auto it = std::max_element( max_remains.cbegin(), max_remains.cend(), max_remains_fn );
-          if ( it == max_remains.end() )
+        auto it = std::max_element( pet.all_wolves.cbegin(), pet.all_wolves.cend(), max_remains_fn );
+        if ( it == pet.all_wolves.end() )
           {
             return 0.0;
           }
 
           return ( *it )->expiration ? ( *it )->expiration->remains().total_seconds() : 0.0;
-        }
-        else
-        {
-          auto p = pet.spirit_wolves.active_pet_max_remains();
-          return p ? p->expiration->remains().total_seconds() : 0;
-        }
       } );
     }
   }
@@ -8644,6 +8658,30 @@ std::unique_ptr<expr_t> shaman_t::create_expression( util::string_view name )
     return make_fn_expr( name, [ this ]() {
         return action.ti_trigger == action.chain_lightning_ti;
     } );
+  }
+
+  if ( util::str_compare_ci( splits[ 0 ], "alpha_wolf_min_remains" ) )
+  {
+    if ( talent.alpha_wolf.ok() )
+    {
+      return make_fn_expr( name, [ this ]() {
+        if ( pet.all_wolves.empty() )
+        {
+          return 0_ms;
+        }
+
+        auto it = std::min_element( pet.all_wolves.begin(), pet.all_wolves.end(),
+          []( const pet::base_wolf_t* l, const pet::base_wolf_t* r ) {
+            return l->alpha_wolf_buff->remains() < r->alpha_wolf_buff->remains();
+        } );
+
+        return ( *it )->alpha_wolf_buff->remains();
+      } );
+    }
+    else
+    {
+      return expr_t::create_constant( splits[ 0 ], 0 );
+    }
   }
 
   return player_t::create_expression( name );
@@ -8712,6 +8750,7 @@ void shaman_t::create_options()
   } ) );
   add_option( opt_obsoleted( "shaman.chain_harvest_allies" ) );
   add_option( opt_int( "shaman.dre_flat_chance", options.dre_flat_chance, -1, 1 ) );
+  add_option( opt_uint( "shaman.dre_forced_failures", options.dre_forced_failures, 0U, 10U ) );
 }
 
 // shaman_t::create_profile ================================================
@@ -8739,6 +8778,7 @@ void shaman_t::copy_from( player_t* source )
   raptor_glyph = p->raptor_glyph;
   options.rotation = p->options.rotation;
   options.dre_flat_chance = p->options.dre_flat_chance;
+  options.dre_forced_failures = p->options.dre_forced_failures;
 }
 
 // shaman_t::create_special_effects ========================================
@@ -8782,11 +8822,6 @@ struct maelstrom_weapon_cb_t : public dbc_proc_callback_t
     {
       shaman->generate_maelstrom_weapon( state );
       //shaman->buff.maelstrom_weapon->increment();
-      auto proc = shaman->get_mw_proc_state_counter( state->action );
-      if ( proc != nullptr )
-      {
-        proc->occur();
-      }
     }
   }
 };
@@ -8861,11 +8896,22 @@ void shaman_t::analyze( sim_t& sim )
     } );
 
     // Re-use MW spend containers to report iteration average over stacks consumed
-    range::for_each( mw_spend_list, [ iterations ]( auto& container ) {
-      auto sum = container.sum();
+    range::for_each( mw_spend_list, [ iterations ]( auto& container_wrapper ) {
+      range::for_each( container_wrapper, [ idx = 0, iterations ]( auto& container ) mutable {
+        auto sum = container.sum();
+        auto count = container.count();
 
-      container.reset();
-      container.add( sum / as<double>( iterations ) );
+        container.reset();
+        // 0-stack MW casts are just the count divided by iterations, not the sum
+        if ( idx++ == 0 )
+        {
+          container.add( count / as<double>( iterations ) );
+        }
+        else
+        {
+          container.add( sum / as<double>( iterations ) );
+        }
+      } );
     } );
   }
 
@@ -8873,6 +8919,20 @@ void shaman_t::analyze( sim_t& sim )
   {
     dre_samples.analyze();
     dre_samples.create_histogram( dre_samples.max() - dre_samples.min() + 1 );
+    dre_uptime_samples.analyze();
+    dre_uptime_samples.create_histogram( std::ceil( dre_uptime_samples.max() ) - std::floor( dre_uptime_samples.min() ) + 1 );
+  }
+}
+
+// shaman_t::datacollection_end ============================================
+
+void shaman_t::datacollection_end()
+{
+  player_t::datacollection_end();
+
+  if ( buff.ascendance->iteration_uptime() > 0_ms )
+  {
+    dre_uptime_samples.add( 100.0 * buff.ascendance->iteration_uptime() / iteration_fight_length );
   }
 }
 
@@ -9010,7 +9070,6 @@ void shaman_t::init_spells()
   // Row 7
   talent.stormblast = _ST( "Stormblast" );
   talent.converging_storms = _ST( "Converging Storms" );
-  talent.chain_lightning2 = _ST( "Chain Lightning" );
   talent.hot_hand = _ST( "Hot Hand" );
   talent.swirling_maelstrom = _ST( "Swirling Maelstrom" );
   // Row 8
@@ -9464,7 +9523,7 @@ void shaman_t::trigger_hot_hand( const action_state_t* state )
   }
 }
 
-void shaman_t::trigger_legacy_of_the_frost_witch( const action_state_t* state,
+void shaman_t::trigger_legacy_of_the_frost_witch( const action_state_t* /* state */,
                                                   unsigned consumed_stacks )
 {
   if ( !talent.legacy_of_the_frost_witch.ok() )
@@ -9480,22 +9539,7 @@ void shaman_t::trigger_legacy_of_the_frost_witch( const action_state_t* state,
   {
     lotfw_counter -= threshold;
     buff.legacy_of_the_frost_witch->trigger();
-    if ( state->action->harmful )
-    {
-      auto s = shaman_spell_t::cast_state( state );
-      if ( bugs && s->exec_type == execute_type::THORIMS_INVOCATION )
-      {
-        proc.munched_lotf->occur();
-      }
-      else
-      {
-        cooldown.strike->reset( false );
-      }
-    }
-    else
-    {
-      cooldown.strike->reset( false );
-    }
+    cooldown.strike->reset( false );
   }
 }
 
@@ -9585,11 +9629,11 @@ void shaman_t::trigger_deeply_rooted_elements( const action_state_t* state )
   }
 
   dre_attempts++;
-  if ( ( options.dre_flat_chance == -1 && is_ptr() ) || options.dre_flat_chance == 0 )
+  if ( options.dre_flat_chance <= 0 )
   {
     // per attempt there exists an ever growing 1% chance
     // proc curve is pushed down by 2%, so the first two attempts have a 0% chance to occur
-    proc_chance = dre_attempts * 0.01 - 0.02;
+    proc_chance = dre_attempts * 0.01 - 0.01 * options.dre_forced_failures;
   }
 
   if ( !rng().roll( proc_chance ) )
@@ -9644,7 +9688,7 @@ void shaman_t::regenerate_flame_shock_dependent_target_list( const action_t* act
 
 void shaman_t::consume_maelstrom_weapon( const action_state_t* state, int stacks )
 {
-  if ( !talent.maelstrom_weapon.ok() || stacks <= 0 )
+  if ( !talent.maelstrom_weapon.ok() )
   {
     return;
   }
@@ -9654,33 +9698,36 @@ void shaman_t::consume_maelstrom_weapon( const action_state_t* state, int stacks
     mw_spend_list.resize( state->action->internal_id + 1 );
   }
 
-  mw_spend_list[ state->action->internal_id ].add( stacks );
+  mw_spend_list[ state->action->internal_id ][ stacks ].add( stacks );
 
-  buff.maelstrom_weapon->decrement( stacks );
-
-  if ( talent.hailstorm.ok() )
+  if ( stacks > 0 )
   {
-    buff.hailstorm->trigger( stacks );
-  }
+    buff.maelstrom_weapon->decrement( stacks );
 
-  trigger_legacy_of_the_frost_witch( state, stacks );
-
-  if ( sets->has_set_bonus( SHAMAN_ENHANCEMENT, T28, B2 ) &&
-       rng().roll( spell.t28_2pc_enh->effectN( 1 ).percent() * stacks ) )
-  {
-    if ( sim->debug )
+    if ( talent.hailstorm.ok() )
     {
-      sim->out_debug.print( "{} Enhancement T28 2PC", name() );
+      buff.hailstorm->trigger( stacks );
     }
 
-    summon_feral_spirits( timespan_t::from_seconds(
-      spell.t28_2pc_enh->effectN( 2 ).base_value() ), 1, true );
-  }
+    trigger_legacy_of_the_frost_witch( state, stacks );
 
-  if ( sets->has_set_bonus( SHAMAN_ENHANCEMENT, T29, B4 ) )
-  {
-    //4pc refreshes duration and adds stacks
-    buff.t29_4pc_enh->trigger( stacks );
+    if ( sets->has_set_bonus( SHAMAN_ENHANCEMENT, T28, B2 ) &&
+         rng().roll( spell.t28_2pc_enh->effectN( 1 ).percent() * stacks ) )
+    {
+      if ( sim->debug )
+      {
+        sim->out_debug.print( "{} Enhancement T28 2PC", name() );
+      }
+
+      summon_feral_spirits( timespan_t::from_seconds(
+        spell.t28_2pc_enh->effectN( 2 ).base_value() ), 1, true );
+    }
+
+    if ( sets->has_set_bonus( SHAMAN_ENHANCEMENT, T29, B4 ) )
+    {
+      //4pc refreshes duration and adds stacks
+      buff.t29_4pc_enh->trigger( stacks );
+    }
   }
 }
 
@@ -9865,11 +9912,15 @@ void shaman_t::trigger_splintered_elements( action_t* secondary )
 
   auto value = talent.splintered_elements->effectN( 1 ).percent();
 
-  buff.splintered_elements->trigger( count_duplicates, value );
+  buff.splintered_elements->trigger( as<int>( count_duplicates ), value );
 }
 
 void shaman_t::trigger_flash_of_lightning()
 {
+  if ( !talent.flash_of_lightning.ok() ) {
+    return;
+  }
+
   if ( !talent.stormkeeper.enabled() && !talent.stormkeeper2.enabled() &&
        !talent.storm_elemental.enabled() && !talent.totemic_recall.enabled() )
   {
@@ -9892,6 +9943,8 @@ void shaman_t::trigger_flash_of_lightning()
   {
     cooldown.totemic_recall->adjust( talent.flash_of_lightning.spell()->effectN( 1 ).time_value(), false );
   }
+
+  cooldown.flame_shock->adjust( talent.flash_of_lightning.spell()->effectN( 1 ).time_value(), false );
 
   proc.flash_of_lightning->occur();
 }
@@ -9929,17 +9982,12 @@ void shaman_t::trigger_swirling_maelstrom( const action_state_t* state )
     return;
   }
 
-  //buff.maelstrom_weapon->trigger( talent.swirling_maelstrom->effectN( 1 ).base_value() );
-  generate_maelstrom_weapon( state, talent.swirling_maelstrom->effectN( 1 ).base_value() );
-  for ( auto i = 0; i < talent.swirling_maelstrom->effectN( 1 ).base_value(); ++i )
-  {
-    proc.maelstrom_weapon_sm->occur();
-  }
+  generate_maelstrom_weapon( state, as<int>( talent.swirling_maelstrom->effectN( 1 ).base_value() ) );
 }
 
 void shaman_t::trigger_static_accumulation_refund( const action_state_t* state, int mw_stacks )
 {
-  if ( !dbc->ptr || !talent.static_accumulation.ok() || mw_stacks == 0 )
+  if ( !talent.static_accumulation.ok() || mw_stacks == 0 )
   {
     return;
   }
@@ -9950,12 +9998,6 @@ void shaman_t::trigger_static_accumulation_refund( const action_state_t* state, 
   }
 
   generate_maelstrom_weapon( state, mw_stacks );
-  //buff.maelstrom_weapon->trigger( mw_stacks );
-
-  for ( auto i = 0; i < mw_stacks; ++i )
-  {
-    proc.maelstrom_weapon_sa_rf->occur();
-  }
 }
 
 // shaman_t::init_buffs =====================================================
@@ -10007,14 +10049,19 @@ void shaman_t::create_buffs()
         if ( next_proc <= sim->current_time() && !t30_proc_possible )
         {
           t30_proc_possible = true;
-          last_t30_proc = sim->current_time();
         }
         if ( t30_proc_possible && !buff.stormkeeper->up() )
         {
-          buff.stormkeeper->trigger( 2 );
+          if ( executing && ( executing->id == 188196 || executing->id == 188443 || executing->id == 114074 ) )
+          {
+            sk_during_cast = true;
+          }
+          buff.stormkeeper->trigger( 1 );
+          last_t30_proc = sim->current_time();
           t30_proc_possible = false;
         }
-      } );
+      } )
+      ->set_tick_zero(true);
   buff.t30_4pc_ele = make_buff( this, "primal_fracture", spell.t30_4pc_ele );
   buff.primordial_wave = make_buff( this, "primordial_wave", find_spell( 327164 ) )
     ->set_trigger_spell( talent.primordial_wave );
@@ -10100,9 +10147,7 @@ void shaman_t::create_buffs()
                                     ->set_refresh_behavior( buff_refresh_behavior::DURATION )
                                     ->set_tick_callback( [ this ]( buff_t* b, int, timespan_t ) {
                                       generate_maelstrom_weapon( action.feral_spirits,
-                                                               b->data().effectN( 1 ).base_value() );
-                                      //buff.maelstrom_weapon->trigger( b->data().effectN( 1 ).base_value() );
-                                      proc.maelstrom_weapon_fs->occur();
+                                                               as<int>( b->data().effectN( 1 ).base_value() ) );
                                     } );
 
   buff.forceful_winds   = make_buff<buff_t>( this, "forceful_winds", find_spell( 262652 ) )
@@ -10167,17 +10212,12 @@ void shaman_t::create_buffs()
                             ->set_default_value_from_effect_type( A_ADD_PCT_MODIFIER, P_GENERIC )
                             ->set_max_stack(
                               talent.overflowing_maelstrom.ok()
-                              ? talent.overflowing_maelstrom->effectN( 1 ).base_value()
+                              ? as<int>( talent.overflowing_maelstrom->effectN( 1 ).base_value() )
                               : find_spell( 334196 )->max_stacks() );
   buff.static_accumulation = make_buff( this, "static_accumulation", find_spell( 384437 ) )
     ->set_default_value( talent.static_accumulation->effectN( 1 ).base_value() )
     ->set_tick_callback( [ this ]( buff_t* b, int, timespan_t ) {
-      generate_maelstrom_weapon( action.ascendance, b->value() );
-      //buff.maelstrom_weapon->trigger( b->value() );
-      for ( int i = 0; i < b->check_value(); ++i )
-      {
-        proc.maelstrom_weapon_sa->occur();
-      }
+      generate_maelstrom_weapon( action.ascendance, as<int>( b->value() ) );
     } );
   buff.doom_winds = make_buff( this, "doom_winds", talent.doom_winds );
   buff.ice_strike = make_buff( this, "ice_strike", talent.ice_strike->effectN( 3 ).trigger() )
@@ -10260,23 +10300,16 @@ void shaman_t::init_procs()
   proc.elemental_blast_mastery = get_proc( "Elemental Blast: Mastery" );
 
   proc.windfury_uw            = get_proc( "Windfury: Unruly Winds" );
-  proc.maelstrom_weapon_fs    = get_proc( "Maelstrom Weapon: Feral Spirit" );
-  proc.maelstrom_weapon_ea    = get_proc( "Maelstrom Weapon: Elemental Assault" );
-  proc.maelstrom_weapon_sm    = get_proc( "Maelstrom Weapon: Swirling Maelstrom" );
-  proc.maelstrom_weapon_pw    = get_proc( "Maelstrom Weapon: Primordial Wave" );
-  proc.maelstrom_weapon_sa    = get_proc( "Maelstrom Weapon: Static Accumulation" );
-  proc.maelstrom_weapon_sa_rf = get_proc( "Maelstrom Weapon: Static Accumulation Refund" );
-  proc.maelstrom_weapon_4pc_enh = get_proc( "Maelstrom Weapon: Enhancement Tier30 4PC" );
   proc.stormflurry            = get_proc( "Stormflurry" );
 
   proc.t28_4pc_enh       = get_proc( "Set Bonus: Tier28 4PC Enhancement" );
+
+  proc.reset_swing_mw            = get_proc( "Maelstrom Weapon Swing Reset" );
 
   for ( size_t i = 0; i < proc.t29_2pc_ele.size(); i++ )
   {
     proc.t29_2pc_ele[ i ] = get_proc( fmt::format( "Set Bonus: Tier29 2PC Elemental spender empowerement, stack {}", i ) );
   }
-
-  proc.munched_lotf = get_proc( "Legacy of the Frost Witch: Bugged Trigger" );
 }
 
 // shaman_t::init_uptimes ====================================================
@@ -10399,7 +10432,7 @@ std::string shaman_t::default_flask() const
                                 ( true_level >= 45 ) ? "greater_flask_of_endless_fathoms" :
                                 "disabled";
 
-  std::string enhancement_flask = ( true_level >= 61 ) ? "phial_of_elemental_chaos_3" :
+  std::string enhancement_flask = ( true_level >= 61 ) ? "phial_of_tepid_versatility_3" :
                                   ( true_level >= 51 ) ? "spectral_flask_of_power" :
                                   ( true_level >= 45 ) ? "greater_flask_of_the_currents" :
                                   "disabled";
@@ -10500,6 +10533,8 @@ void shaman_t::init_action_list_elemental()
     precombat->add_action( "snapshot_stats", "Snapshot raid buffed stats before combat begins and pre-potting is done." );
     precombat->add_action( "flametongue_weapon,if=talent.improved_flametongue_weapon.enabled", "Ensure weapon enchant is applied if you've selected Improved Flametongue Weapon." );
     precombat->add_action( "potion" );
+    precombat->add_action( "stormkeeper" );
+    precombat->add_action( "icefury" );
 
     // "Default" APL controlling logic flow to specialized sub-APLs
     def->add_action( "spiritwalkers_grace,moving=1,if=movement.distance>6", "Enable more movement." );
@@ -10544,6 +10579,8 @@ void shaman_t::init_action_list_elemental()
         "primordial_wave,target_if=min:dot.flame_shock.remains,if=!buff.primordial_wave.up&talent.master_of_the_elements.enabled&!talent.lightning_rod.enabled",
         "Spread Flame Shock using Surge of Power. Don't waste buffs by resets (resets are gone, but I'll "
         "keep that logic here)." );
+    aoe->add_action( "flame_shock,target_if=refreshable,if=buff.surge_of_power.up&talent.lightning_rod.enabled&talent.windspeakers_lava_resurgence.enabled&dot.flame_shock.remains<target.time_to_die-16&active_enemies<5",
+                     "Spread Flame Shock using Surge of Power on up to 4 for Lightning builds with Windspeaker's Lava Resurgence." );
     aoe->add_action( "flame_shock,target_if=refreshable,if=buff.surge_of_power.up&(!talent.lightning_rod.enabled|talent.skybreakers_fiery_demise.enabled)&dot.flame_shock.remains<target.time_to_die-5&active_dot.flame_shock<6",
                      "Spread Flame Shock using Surge of Power up to 6." );
     aoe->add_action( "flame_shock,target_if=refreshable,if=talent.master_of_the_elements.enabled&!talent.lightning_rod.enabled&dot.flame_shock.remains<target.time_to_die-5&active_dot.flame_shock<6",
@@ -10564,7 +10601,7 @@ void shaman_t::init_action_list_elemental()
                      "Shia_LaBeouf__Just_Do_It__Motivational_Speech_(Original_Video_by_LaBeouf__R%C3%B6nkk%C3%B6___"
                      "Turner)_0-4_screenshot.jpg" );
     aoe->add_action(
-        "lava_burst,target_if=dot.flame_shock.remains,if=cooldown_react&buff.lava_surge.up&talent.master_of_the_elements.enabled&!buff.master_of_the_elements.up&(maelstrom>=60-5*talent.eye_of_the_storm.rank-2*talent.flow_of_power.enabled)&(!talent.echoes_of_great_sundering.enabled|buff.echoes_of_great_sundering.up)&(!buff.ascendance.up&active_enemies>3&talent.unrelenting_calamity.enabled|active_enemies>3&!talent.unrelenting_calamity.enabled|active_enemies=3)",
+        "lava_burst,target_if=dot.flame_shock.remains,if=cooldown_react&buff.lava_surge.up&talent.master_of_the_elements.enabled&!buff.master_of_the_elements.up&(maelstrom>=60-5*talent.eye_of_the_storm.rank-2*talent.flow_of_power.enabled)&(!talent.echoes_of_great_sundering.enabled&!talent.lightning_rod.enabled|buff.echoes_of_great_sundering.up)&(!buff.ascendance.up&active_enemies>3&talent.unrelenting_calamity.enabled|active_enemies>3&!talent.unrelenting_calamity.enabled|active_enemies=3)",
         "Cast Lava Burst to buff your immediately follow-up Earthquake with Master of the Elements." );
     aoe->add_action(
         "earthquake,if=!talent.echoes_of_great_sundering.enabled&active_enemies>3&(spell_targets.chain_lightning>3|spell_targets.lava_beam>3)",
@@ -10592,6 +10629,9 @@ void shaman_t::init_action_list_elemental()
     aoe->add_action(
         "earth_shock,if=talent.echoes_of_great_sundering.enabled",
         "Use the talents you selected. Did you invest only 1 point in it? In this case this'll be a DPS decrease." );
+    aoe->add_action( "icefury,if=!buff.ascendance.up&talent.electrified_shocks.enabled&(talent.lightning_rod.enabled&active_enemies<5&!buff.master_of_the_elements.up|talent.deeply_rooted_elements.enabled&active_enemies=3)", "Use Icefury if you can get the full benefit from Electrified Shocks. If more targets are present ignore it. High priority on 3 targets." );
+    aoe->add_action( "frost_shock,if=!buff.ascendance.up&buff.icefury.up&talent.electrified_shocks.enabled&(!debuff.electrified_shocks.up|buff.icefury.remains<gcd)&(talent.lightning_rod.enabled&active_enemies<5&!buff.master_of_the_elements.up|talent.deeply_rooted_elements.enabled&active_enemies=3)", "Spread out your Frost Shock casts to empower as many Chain Lightnings as possible." );
+    aoe->add_action( "lava_burst,target_if=dot.flame_shock.remains,if=talent.master_of_the_elements.enabled&!buff.master_of_the_elements.up&(buff.stormkeeper.up|t30_2pc_timer.next_tick<3&set_bonus.tier30_2pc)&(maelstrom<60-5*talent.eye_of_the_storm.rank-2*talent.flow_of_power.enabled-10)&active_enemies<5", "Buff Stormkeeper with Master of the elements on 3-4 targets.");
     aoe->add_action( "lava_beam,if=buff.stormkeeper.up", "Stormkeeper is strong and should be used." );
     aoe->add_action( "chain_lightning,if=buff.stormkeeper.up", "Stormkeeper is strong and should be used." );
     aoe->add_action( "lava_beam,if=buff.power_of_the_maelstrom.up&buff.ascendance.remains>cast_time",
@@ -10626,14 +10666,18 @@ void shaman_t::init_action_list_elemental()
     // Single target APL
     single_target->add_action( "fire_elemental", "Keep your cooldowns rolling." );
     single_target->add_action( "storm_elemental", "Keep your cooldowns rolling." );
-    single_target->add_action( "totemic_recall,if=cooldown.liquid_magma_totem.remains>45", "Reset LMT CD as early as possible." );
-    single_target->add_action( "liquid_magma_totem", "Keep your cooldowns rolling." );
+    single_target->add_action( "totemic_recall,if=cooldown.liquid_magma_totem.remains>45&(talent.lava_surge.enabled&talent.splintered_elements.enabled|active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1))", "Reset LMT CD as early as possible." );
+    single_target->add_action( "liquid_magma_totem,if=talent.lava_surge.enabled&talent.splintered_elements.enabled|active_dot.flame_shock=0|dot.flame_shock.remains<6|active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)", "Keep your cooldowns rolling." );
     single_target->add_action(
         "primordial_wave,target_if=min:dot.flame_shock.remains,if=!buff.primordial_wave.up&!buff.splintered_elements.up",
         "Use Primordial Wave as much as possible without wasting buffs." );
-    single_target->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,if=active_enemies=1&refreshable&!buff.surge_of_power.up" );
-    single_target->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,if=active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)&refreshable&!buff.surge_of_power.up&(talent.deeply_rooted_elements.enabled|talent.ascendance.enabled|talent.primordial_wave.enabled|talent.searing_flames.enabled|talent.magma_chamber.enabled),cycle_targets=1", "Spread Flame Shock to multiple targets only if talents were selected that benefit from it." );
-    single_target->add_action( "stormkeeper,if=!buff.ascendance.up&!buff.stormkeeper.up" );
+    single_target->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,if=active_enemies=1&refreshable&!buff.surge_of_power.up&(!buff.master_of_the_elements.up|(!buff.stormkeeper.up&(talent.elemental_blast.enabled&maelstrom<90-8*talent.eye_of_the_storm.rank|maelstrom<60-5*talent.eye_of_the_storm.rank)))" );
+    single_target->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,if=active_dot.flame_shock=0&active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)&(talent.deeply_rooted_elements.enabled|talent.ascendance.enabled|talent.primordial_wave.enabled|talent.searing_flames.enabled|talent.magma_chamber.enabled)&(!buff.master_of_the_elements.up&(buff.stormkeeper.up|cooldown.stormkeeper.remains=0)|!talent.surge_of_power.enabled)",
+      "Use Flame shock without Surge of Power if you can't spread it with SoP because it is going to be used on Stormkeeper or Surge of Power is not talented.");
+    single_target->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,if=active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)&refreshable&(talent.deeply_rooted_elements.enabled|talent.ascendance.enabled|talent.primordial_wave.enabled|talent.searing_flames.enabled|talent.magma_chamber.enabled)&(buff.surge_of_power.up&!buff.stormkeeper.up&!cooldown.stormkeeper.remains=0|!talent.surge_of_power.enabled),cycle_targets=1", "Spread Flame Shock to multiple targets only if talents were selected that benefit from it." );
+    single_target->add_action( "stormkeeper,if=!buff.ascendance.up&!buff.stormkeeper.up&maelstrom>=116&talent.elemental_blast.enabled&talent.surge_of_power.enabled&talent.swelling_maelstrom.enabled&!talent.lava_surge.enabled&!talent.echo_of_the_elements.enabled&!talent.primordial_surge.enabled", "{EB/Swelling/SoP Lightning build} Start SK window if you have enough maelstrom to: EB > SoP SK_LB > LvB > EB." );
+    single_target->add_action( "stormkeeper,if=!buff.ascendance.up&!buff.stormkeeper.up&buff.surge_of_power.up&!talent.lava_surge.enabled&!talent.echo_of_the_elements.enabled&!talent.primordial_surge.enabled", "{EB/SoP Lightning builds} Use Stormkeeper if you already got Surge of Power buff rolling." );
+    single_target->add_action( "stormkeeper,if=!buff.ascendance.up&!buff.stormkeeper.up&(!talent.surge_of_power.enabled|!talent.elemental_blast.enabled|talent.lava_surge.enabled|talent.echo_of_the_elements.enabled|talent.primordial_surge.enabled)" );
     single_target->add_action( "ascendance,if=!buff.stormkeeper.up" );
     single_target->add_action( "lightning_bolt,if=buff.stormkeeper.up&buff.surge_of_power.up", "Stormkeeper is strong and should be used." );
     single_target->add_action( "lava_beam,if=active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)&buff.stormkeeper.up&!talent.surge_of_power.enabled", "Stormkeeper is strong and should be used." );
@@ -10643,13 +10687,15 @@ void shaman_t::init_action_list_elemental()
     single_target->add_action( "lightning_bolt,if=buff.stormkeeper.up&!talent.surge_of_power.enabled&!talent.master_of_the_elements.enabled", "Stormkeeper is strong and should be used." );
     single_target->add_action( "lightning_bolt,if=buff.surge_of_power.up", "Surge of Power is strong and should be used." );
     single_target->add_action( "icefury,if=talent.electrified_shocks.enabled" );
-    single_target->add_action( "frost_shock,if=buff.icefury.up&talent.electrified_shocks.enabled&(!debuff.electrified_shocks.up|buff.icefury.remains<=gcd)" );
+    single_target->add_action( "frost_shock,if=buff.icefury.up&talent.electrified_shocks.enabled&(debuff.electrified_shocks.remains<2|buff.icefury.remains<=gcd)" );
     single_target->add_action( "frost_shock,if=buff.icefury.up&talent.electrified_shocks.enabled&maelstrom>=50&debuff.electrified_shocks.remains<2*gcd&buff.stormkeeper.up" );
     single_target->add_action( "lava_beam,if=active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)&buff.power_of_the_maelstrom.up&buff.ascendance.remains>cast_time" );
-    single_target->add_action( "lava_burst,if=buff.windspeakers_lava_resurgence.up", "Windspeaker's Lava Resurgence is strong. Don't sit on it." );
-    single_target->add_action( "lava_burst,if=cooldown_react&buff.lava_surge.up", "Lava Surge is neat. Utilize it." );
+    single_target->add_action( "frost_shock,if=buff.icefury.up&buff.stormkeeper.up&!talent.lava_surge.enabled&!talent.echo_of_the_elements.enabled&!talent.primordial_surge.enabled&talent.elemental_blast.enabled&(maelstrom>=61&maelstrom<75&cooldown.lava_burst.remains>gcd|maelstrom>=49&maelstrom<63&cooldown.lava_burst.ready)", "{EB/SoP Lightning builds} Spend extra Frost Shock if it gives you the ability to get to next spender without using Stormkeeper charge." );
+    single_target->add_action( "frost_shock,if=buff.icefury.up&buff.stormkeeper.up&!talent.lava_surge.enabled&!talent.echo_of_the_elements.enabled&!talent.elemental_blast.enabled&(maelstrom>=36&maelstrom<50&cooldown.lava_burst.remains>gcd|maelstrom>=24&maelstrom<38&cooldown.lava_burst.ready)", "{ES/SoP Lightning builds} Spend extra Frost Shock if it gives you the ability to get to next spender without using Stormkeeper charge." );
+    single_target->add_action( "lava_burst,if=buff.windspeakers_lava_resurgence.up&(talent.echo_of_the_elements.enabled|talent.lava_surge.enabled|talent.primordial_surge.enabled|maelstrom>=63&talent.master_of_the_elements.enabled|maelstrom>=38&buff.echoes_of_great_sundering.up&active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)|!talent.elemental_blast.enabled)", "Windspeaker's Lava Resurgence is strong. Don't sit on it...Unless it's Lightning build and you save it to buff Elemental Blast." );
+    single_target->add_action( "lava_burst,if=cooldown_react&buff.lava_surge.up&(talent.echo_of_the_elements.enabled|talent.lava_surge.enabled|talent.primordial_surge.enabled|!talent.master_of_the_elements.enabled|!talent.elemental_blast.enabled)", "Lava Surge is neat. Utilize it...Unless it's Lightning build and you save it to buff Elemental Blast." );
     single_target->add_action( "lava_burst,if=talent.master_of_the_elements.enabled&!buff.master_of_the_elements.up&maelstrom>=50&!talent.swelling_maelstrom.enabled&maelstrom<=80", "Buff your next Maelstrom Spender with MotE if it won't cap your maelstrom." );
-    single_target->add_action( "lava_burst,if=talent.master_of_the_elements.enabled&!buff.master_of_the_elements.up&maelstrom>=50&talent.swelling_maelstrom.enabled&maelstrom<=130", "Buff your next Maelstrom Spender with MotE if it won't cap your maelstrom." );
+    single_target->add_action( "lava_burst,if=talent.master_of_the_elements.enabled&!buff.master_of_the_elements.up&(maelstrom>=75|maelstrom>=50&!talent.elemental_blast.enabled)&talent.swelling_maelstrom.enabled&maelstrom<=130", "Buff your next Maelstrom Spender with MotE if it won't cap your maelstrom." );
     single_target->add_action(
         "earthquake,if=buff.echoes_of_great_sundering.up&(!talent.elemental_blast.enabled&active_enemies<2|active_enemies>1)",
         "Use the talents you selected. Did you invest only 1 point in it? In this case this'll be a DPS decrease. Additionally Elemental Blast is stronger than EoGS. In this case don't use Earthquake on single target." );
@@ -10662,22 +10708,35 @@ void shaman_t::init_action_list_elemental()
     single_target->add_action( "lava_burst,target_if=dot.flame_shock.remains>2,if=enemies=1&talent.deeply_rooted_elements.enabled", "Single target Lava Burst is stronk." );
     single_target->add_action( "frost_shock,if=buff.icefury.up&talent.flux_melting.enabled&!buff.flux_melting.up",
                                "Spread out your Icefury usage if you can get more use out of accompanied buffs." );
-    single_target->add_action( "frost_shock,if=buff.icefury.up&(talent.electrified_shocks.enabled&!debuff.electrified_shocks.up|buff.icefury.remains<6)",
+    single_target->add_action( "frost_shock,if=buff.icefury.up&(talent.electrified_shocks.enabled&debuff.electrified_shocks.remains<2|buff.icefury.remains<6)",
                                "Spread out your Icefury usage if you can get more use out of accompanied buffs." );
     single_target->add_action(
+        "lava_burst,target_if=dot.flame_shock.remains>2,if=talent.echo_of_the_elements.enabled|talent.lava_surge."
+        "enabled|talent.primordial_surge.enabled|!talent.elemental_blast.enabled|!talent.master_of_the_elements."
+        "enabled|buff.stormkeeper.up",
+        "Use Lava Burst normally with fire builds. Save it as much as possible in lightning builds unless you cant use "
+        "Lightning Bolt without wasting Stormkeeper charges." );
+        single_target->add_action(
+        "chain_lightning,if=buff.power_of_the_maelstrom.up&talent.unrelenting_calamity.enabled&active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)",
+        "Utilize the Power of the Maelstrom buff if your Chain Lightning is empowered by Unrelenting Calamity." );
+        single_target->add_action(
         "lightning_bolt,if=buff.power_of_the_maelstrom.up&talent.unrelenting_calamity.enabled",
         "Utilize the Power of the Maelstrom buff if your Lightning Bolt is empowered by Unrelenting Calamity." );
     single_target->add_action( "icefury" );
     single_target->add_action(
+        "chain_lightning,if=pet.storm_elemental.active&debuff.lightning_rod.up&(debuff.electrified_shocks.up|buff.power_of_the_maelstrom.up)&active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)",
+        "Spam Chain Lightning if Storm Elemental is active. But honor all previous priorities." );
+    single_target->add_action(
         "lightning_bolt,if=pet.storm_elemental.active&debuff.lightning_rod.up&(debuff.electrified_shocks.up|buff.power_of_the_maelstrom.up)",
         "Spam Lightning Bolt if Storm Elemental is active. But honor all previous priorities." );
-    single_target->add_action( "frost_shock,if=buff.icefury.up&buff.master_of_the_elements.up&!buff.lava_surge.up&!talent.electrified_shocks.enabled&!talent.flux_melting.enabled&cooldown.lava_burst.charges_fractional<1.0&talent.echoes_of_the_elements.enabled", "If you have MotE up and aren't at risk of capping LvB, spend MotE on FrS/LB." );
+    single_target->add_action( "frost_shock,if=buff.icefury.up&buff.master_of_the_elements.up&!buff.lava_surge.up&!talent.electrified_shocks.enabled&!talent.flux_melting.enabled&cooldown.lava_burst.charges_fractional<1.0&talent.echo_of_the_elements.enabled", "If you have MotE up and aren't at risk of capping LvB, spend MotE on FrS/LB." );
     single_target->add_action( "frost_shock,if=buff.icefury.up&talent.flux_melting.enabled" );
-    single_target->add_action( "lightning_bolt,if=buff.master_of_the_elements.up&!buff.lava_surge.up&(cooldown.lava_burst.charges_fractional<1.0&talent.echoes_of_the_elements.enabled)", "If you have MotE up and aren't at risk of capping LvB, spend MotE on FrS/LB." );
-    single_target->add_action( "lava_burst,target_if=dot.flame_shock.remains>2" );
+    single_target->add_action( "chain_lightning,if=buff.master_of_the_elements.up&!buff.lava_surge.up&(cooldown.lava_burst.charges_fractional<1.0&talent.echo_of_the_elements.enabled)&active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)", 
+                              "If you have MotE up and aren't at risk of capping LvB, spend MotE on Chain Lightning." );
+    single_target->add_action( "lightning_bolt,if=buff.master_of_the_elements.up&!buff.lava_surge.up&(cooldown.lava_burst.charges_fractional<1.0&talent.echo_of_the_elements.enabled)", "If you have MotE up and aren't at risk of capping LvB, spend MotE on FrS/LB." );
     single_target->add_action( "frost_shock,if=buff.icefury.up&!talent.electrified_shocks.enabled&!talent.flux_melting.enabled",
                                "Use your Icefury buffs if you didn't improve the talent." );
-    single_target->add_action( "chain_lightning,if=active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)", "Casting Chain Lightning at two targets is mor efficient than Lightning Bolt." );
+    single_target->add_action( "chain_lightning,if=active_enemies>1&(spell_targets.chain_lightning>1|spell_targets.lava_beam>1)", "Casting Chain Lightning at two targets is more efficient than Lightning Bolt." );
     single_target->add_action( "lightning_bolt", "Filler spell. Always available. Always the bottom line." );
     single_target->add_action( "flame_shock,moving=1,target_if=refreshable" );
     single_target->add_action( "flame_shock,moving=1,if=movement.distance>6" );
@@ -10715,8 +10774,9 @@ void shaman_t::init_action_list_enhancement()
   precombat->add_action( "flametongue_weapon" );
   precombat->add_action( "lightning_shield" );
   precombat->add_action( "windfury_totem" );
-  precombat->add_action( "variable,name=trinket1_is_weird,value=trinket.1.is.the_first_sigil|trinket.1.is.scars_of_fraternal_strife|trinket.1.is.cache_of_acquired_treasures" );
-  precombat->add_action( "variable,name=trinket2_is_weird,value=trinket.2.is.the_first_sigil|trinket.2.is.scars_of_fraternal_strife|trinket.2.is.cache_of_acquired_treasures" );
+  precombat->add_action( "variable,name=trinket1_is_weird,value=trinket.1.is.algethar_puzzle_box|trinket.1.is.manic_grieftorch|trinket.1.is.elementium_pocket_anvil|trinket.1.is.beacon_to_the_beyond" );
+  precombat->add_action( "variable,name=trinket2_is_weird,value=trinket.2.is.algethar_puzzle_box|trinket.2.is.manic_grieftorch|trinket.2.is.elementium_pocket_anvil|trinket.2.is.beacon_to_the_beyond" );
+  precombat->add_action( "variable,name=min_talented_cd_remains,value=((cooldown.feral_spirit.remains%(1+1.5*talent.witch_doctors_ancestry.rank))+1000*!talent.feral_spirit.enabled)<?(cooldown.doom_winds.remains+1000*!talent.doom_winds.enabled)<?(cooldown.ascendance.remains+1000*!talent.ascendance.enabled)" );
 
   // Snapshot stats
   precombat->add_action( "snapshot_stats", "Snapshot raid buffed stats before combat begins and pre-potting is done." );
@@ -10725,7 +10785,7 @@ void shaman_t::init_action_list_enhancement()
   def->add_action( this, "Bloodlust", "line_cd=600" );
 
   // In-combat potion
-  def->add_action( "potion,if=(talent.ascendance.enabled&raid_event.adds.in>=90&cooldown.ascendance.remains<10)|(talent.doom_winds.enabled&buff.doom_winds.up)|(!talent.doom_winds.enabled&!talent.ascendance.enabled&talent.feral_spirit.enabled&buff.feral_spirit.up)|(!talent.doom_winds.enabled&!talent.ascendance.enabled&!talent.feral_spirit.enabled)|active_enemies>1|fight_remains<30" );
+  def->add_action( "potion,if=(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%300<=30)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
 
   // "Default" APL controlling logic flow to specialized sub-APLs
   def->add_action( this, "Wind Shear", "", "Interrupt of casts." );
@@ -10733,104 +10793,100 @@ void shaman_t::init_action_list_enhancement()
   def->add_action( "auto_attack" );
 
   //_Use_items
-    def->add_action( "use_item,name=the_first_sigil,if=(talent.ascendance.enabled&raid_event.adds.in>=90&cooldown.ascendance.remains<10)|(talent.hot_hand.enabled&buff.molten_weapon.up)|buff.icy_edge.up|(talent.stormflurry.enabled&buff.crackling_surge.up)|active_enemies>1|fight_remains<30" );
-    def->add_action( "use_item,name=cache_of_acquired_treasures,if=buff.acquired_sword.up|fight_remains<25" );
-    def->add_action( "use_item,name=scars_of_fraternal_strife,if=!buff.scars_of_fraternal_strife_4.up|fight_remains<31|raid_event.adds.in<16|active_enemies>1" );
-    def->add_action( "use_items,slots=trinket1,if=!variable.trinket1_is_weird" );
-    def->add_action( "use_items,slots=trinket2,if=!variable.trinket2_is_weird" );
+    def->add_action( "use_item,name=elementium_pocket_anvil,use_off_gcd=1" );
+    def->add_action( "use_item,name=algethar_puzzle_box,use_off_gcd=1,if=(!buff.ascendance.up&!buff.feral_spirit.up&!buff.doom_winds.up)|(talent.ascendance.enabled&(cooldown.ascendance.remains<2*action.stormstrike.gcd))|(fight_remains%%180<=30)" );
+    def->add_action( "use_item,slot=trinket1,if=!variable.trinket1_is_weird&trinket.1.has_use_buff&(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%trinket.1.cooldown.duration<=trinket.1.buff.any.duration)|(variable.min_talented_cd_remains>=trinket.1.cooldown.duration)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
+    def->add_action( "use_item,slot=trinket2,if=!variable.trinket2_is_weird&trinket.2.has_use_buff&(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%trinket.2.cooldown.duration<=trinket.2.buff.any.duration)|(variable.min_talented_cd_remains>=trinket.2.cooldown.duration)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
+    def->add_action( "use_item,name=beacon_to_the_beyond,use_off_gcd=1,if=(!buff.ascendance.up&!buff.feral_spirit.up&!buff.doom_winds.up)|(fight_remains%%150<=5)" );
+    def->add_action( "use_item,name=manic_grieftorch,use_off_gcd=1,if=(!buff.ascendance.up&!buff.feral_spirit.up&!buff.doom_winds.up)|(fight_remains%%120<=5)" );
+    def->add_action( "use_item,slot=trinket1,if=!variable.trinket1_is_weird&!trinket.1.has_use_buff" );
+    def->add_action( "use_item,slot=trinket2,if=!variable.trinket2_is_weird&!trinket.2.has_use_buff" );
 
     //_Racials
-    def->add_action( "blood_fury,if=!talent.ascendance.enabled|buff.ascendance.up|cooldown.ascendance.remains>50" );
-    def->add_action( "berserking,if=!talent.ascendance.enabled|buff.ascendance.up" );
-    def->add_action( "fireblood,if=!talent.ascendance.enabled|buff.ascendance.up|cooldown.ascendance.remains>50" );
-    def->add_action( "ancestral_call,if=!talent.ascendance.enabled|buff.ascendance.up|cooldown.ascendance.remains>50" );
+    def->add_action( "blood_fury,if=(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%action.blood_fury.cooldown<=action.blood_fury.duration)|(variable.min_talented_cd_remains>=action.blood_fury.cooldown)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
+    def->add_action( "berserking,if=(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%action.berserking.cooldown<=action.berserking.duration)|(variable.min_talented_cd_remains>=action.berserking.cooldown)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
+    def->add_action( "fireblood,if=(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%action.fireblood.cooldown<=action.fireblood.duration)|(variable.min_talented_cd_remains>=action.fireblood.cooldown)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
+    def->add_action( "ancestral_call,if=(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%action.ancestral_call.cooldown<=action.ancestral_call.duration)|(variable.min_talented_cd_remains>=action.ancestral_call.cooldown)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
 
     //_Cooldowns
+    def->add_action( "invoke_external_buff,name=power_infusion,if=(buff.ascendance.up|buff.feral_spirit.up|buff.doom_winds.up|(fight_remains%%120<=20)|(variable.min_talented_cd_remains>=120)|(!talent.ascendance.enabled&!talent.feral_spirit.enabled&!talent.doom_winds.enabled))" );
     def->add_action( "feral_spirit" );
-    def->add_action( "ascendance,if=(ti_lightning_bolt&active_enemies=1&raid_event.adds.in>=90)|(ti_chain_lightning&active_enemies>1)" );
+    def->add_action( "ascendance,if=dot.flame_shock.ticking&((ti_lightning_bolt&active_enemies=1&raid_event.adds.in>=90)|(ti_chain_lightning&active_enemies>1))" );
     def->add_action( "doom_winds,if=raid_event.adds.in>=90|active_enemies>1" );
 
     def->add_action( "call_action_list,name=single,if=active_enemies=1", "If_only_one_enemy,_priority_follows_the_'single'_action_list." );
     def->add_action( "call_action_list,name=aoe,if=active_enemies>1", "On_multiple_enemies,_the_priority_follows_the_'aoe'_action_list." );
 
-    single->add_action( "windstrike,if=talent.thorims_invocation.enabled&buff.maelstrom_weapon.stack>=1" );
-    single->add_action( "lava_lash,if=buff.hot_hand.up|buff.ashen_catalyst.stack=8|(buff.ashen_catalyst.stack>=5&buff.maelstrom_of_elements.up&buff.maelstrom_weapon.stack<=6)" );
+    single->add_action( "primordial_wave,if=!dot.flame_shock.ticking&talent.lashing_flames.enabled&(raid_event.adds.in>42|raid_event.adds.in<6)" );
+    single->add_action( "flame_shock,if=!ticking&talent.lashing_flames.enabled" );
+    single->add_action( "elemental_blast,if=buff.maelstrom_weapon.stack>=5&talent.elemental_spirits.enabled&feral_spirit.active>=4" );
+    single->add_action( "sundering,if=set_bonus.tier30_2pc&raid_event.adds.in>=40" );
+    single->add_action( "lightning_bolt,if=buff.maelstrom_weapon.stack>=5&buff.crackling_thunder.down&buff.ascendance.up&ti_chain_lightning&(buff.ascendance.remains>(cooldown.strike.remains+gcd))" );
+    single->add_action( "windstrike,if=talent.thorims_invocation.enabled&buff.maelstrom_weapon.stack>=1&(talent.deeply_rooted_elements.enabled|(talent.stormblast.enabled&buff.stormbringer.up)|(talent.elemental_assault.enabled&talent.stormflurry.enabled)|ti_lightning_bolt)" );
+    single->add_action( "stormstrike,if=buff.doom_winds.up|talent.deeply_rooted_elements.enabled|(talent.stormblast.enabled&buff.stormbringer.up)|((talent.elemental_assault.enabled&talent.stormflurry.enabled)&buff.maelstrom_weapon.stack<buff.maelstrom_weapon.max_stack)" );
+    single->add_action( "lava_lash,if=buff.hot_hand.up" );
     single->add_action( "windfury_totem,if=!buff.windfury_totem.up" );
-    single->add_action( "stormstrike,if=buff.doom_winds.up" );
-    single->add_action( "crash_lightning,if=buff.doom_winds.up" );
-    single->add_action( "ice_strike,if=buff.doom_winds.up" );
-    single->add_action( "sundering,if=buff.doom_winds.up" );
-    single->add_action( "primordial_wave,if=buff.primordial_wave.down&(raid_event.adds.in>42|raid_event.adds.in<6)" );
-    single->add_action( "flame_shock,if=!ticking" );
+    single->add_action( "elemental_blast,if=buff.maelstrom_weapon.stack>=5&charges=max_charges" );
     single->add_action( "lightning_bolt,if=buff.maelstrom_weapon.stack>=5&buff.primordial_wave.up&raid_event.adds.in>buff.primordial_wave.remains&(!buff.splintered_elements.up|fight_remains<=12)" );
-    single->add_action( "elemental_blast,if=talent.elemental_spirits.enabled&(charges=max_charges|buff.feral_spirit.up)&buff.maelstrom_weapon.stack>=8" );
-    single->add_action( "ice_strike,if=talent.hailstorm.enabled" );
-    single->add_action( "stormstrike,if=set_bonus.tier29_2pc&buff.maelstrom_of_elements.down&buff.maelstrom_weapon.stack<=5" );
-    single->add_action( "frost_shock,if=buff.hailstorm.up" );
+    single->add_action( "chain_lightning,if=buff.maelstrom_weapon.stack>=5&buff.crackling_thunder.up" );
+    single->add_action( "elemental_blast,if=buff.maelstrom_weapon.stack>=5&(buff.feral_spirit.up|!talent.elemental_spirits.enabled)" );
+    single->add_action( "lava_burst,if=!talent.thorims_invocation.enabled&buff.maelstrom_weapon.stack>=5" );
+    single->add_action( "lightning_bolt,if=((buff.maelstrom_weapon.stack=buff.maelstrom_weapon.max_stack)|(talent.static_accumulation.enabled&buff.maelstrom_weapon.stack>=5))&buff.primordial_wave.down" );
+    single->add_action( "ice_strike,if=buff.doom_winds.up" );
+    single->add_action( "sundering,if=buff.doom_winds.up&raid_event.adds.in>=40" );
+    single->add_action( "crash_lightning,if=buff.doom_winds.up|(talent.alpha_wolf.enabled&feral_spirit.active&alpha_wolf_min_remains=0)" );
+    single->add_action( "primordial_wave,if=raid_event.adds.in>42|raid_event.adds.in<6" );
+    single->add_action( "flame_shock,if=!ticking" );
     single->add_action( "lava_lash,if=talent.molten_assault.enabled&dot.flame_shock.refreshable" );
-    single->add_action( "windstrike,if=talent.deeply_rooted_elements.enabled|buff.earthen_weapon.up|buff.legacy_of_the_frost_witch.up" );
-    single->add_action( "stormstrike,if=talent.deeply_rooted_elements.enabled|buff.earthen_weapon.up|buff.legacy_of_the_frost_witch.up" );
-    single->add_action( "elemental_blast,if=(talent.elemental_spirits.enabled&buff.maelstrom_weapon.stack=10)|(!talent.elemental_spirits.enabled&buff.maelstrom_weapon.stack>=5)" );
-    single->add_action( "lava_burst,if=buff.maelstrom_weapon.stack>=5" );
-    single->add_action( "lightning_bolt,if=buff.maelstrom_weapon.stack=10&buff.primordial_wave.down" );
+    single->add_action( "ice_strike,if=!buff.ice_strike.up" );
+    single->add_action( "frost_shock,if=buff.hailstorm.up" );
+    single->add_action( "lava_lash" );
+    single->add_action( "ice_strike" );
     single->add_action( "windstrike" );
     single->add_action( "stormstrike" );
-    single->add_action( "windfury_totem,if=buff.windfury_totem.remains<10" );
-    single->add_action( "ice_strike" );
-    single->add_action( "lava_lash" );
-    single->add_action( "elemental_blast,if=talent.elemental_spirits.enabled&(charges=max_charges|buff.feral_spirit.up)&buff.maelstrom_weapon.stack>=5" );
-    single->add_action( "bag_of_tricks" );
-    single->add_action( "lightning_bolt,if=buff.maelstrom_weapon.stack>=5&buff.primordial_wave.down" );
     single->add_action( "sundering,if=raid_event.adds.in>=40" );
-    single->add_action( "fire_nova,if=talent.swirling_maelstrom.enabled&active_dot.flame_shock" );
+    single->add_action( "bag_of_tricks" );
+    single->add_action( "fire_nova,if=talent.swirling_maelstrom.enabled&active_dot.flame_shock&buff.maelstrom_weapon.stack<buff.maelstrom_weapon.max_stack" );
+    single->add_action( "lightning_bolt,if=talent.hailstorm.enabled&buff.maelstrom_weapon.stack>=5&buff.primordial_wave.down" );
     single->add_action( "frost_shock" );
     single->add_action( "crash_lightning" );
     single->add_action( "fire_nova,if=active_dot.flame_shock" );
     single->add_action( "earth_elemental" );
     single->add_action( "flame_shock" );
+    single->add_action( "lightning_bolt,if=buff.maelstrom_weapon.stack>=5&buff.primordial_wave.down" );
     single->add_action( "windfury_totem,if=buff.windfury_totem.remains<30" );
 
-    aoe->add_action( "crash_lightning,if=buff.doom_winds.up|!buff.crash_lightning.up" );
-    aoe->add_action( "lightning_bolt,if=(active_dot.flame_shock=active_enemies|active_dot.flame_shock=6)&buff.primordial_wave.up&buff.maelstrom_weapon.stack>=(5+5*talent.overflowing_maelstrom.enabled)&(!buff.splintered_elements.up|fight_remains<=12|raid_event.adds.remains<=gcd)" );
-    aoe->add_action( "sundering,if=buff.doom_winds.up" );
-    aoe->add_action( "fire_nova,if=active_dot.flame_shock=6|(active_dot.flame_shock>=4&active_dot.flame_shock=active_enemies)" );
+    aoe->add_action( "crash_lightning,if=talent.crashing_storms.enabled&((talent.unruly_winds.enabled&active_enemies>=10)|active_enemies>=15)" );
+    aoe->add_action( "lightning_bolt,if=(active_dot.flame_shock=active_enemies|active_dot.flame_shock=6)&buff.primordial_wave.up&buff.maelstrom_weapon.stack=buff.maelstrom_weapon.max_stack&(!buff.splintered_elements.up|fight_remains<=12|raid_event.adds.remains<=gcd)" );
+    aoe->add_action( "lava_lash,if=talent.molten_assault.enabled&(talent.primordial_wave.enabled|talent.fire_nova.enabled)&dot.flame_shock.ticking&(active_dot.flame_shock<active_enemies)&active_dot.flame_shock<6" );
     aoe->add_action( "primordial_wave,target_if=min:dot.flame_shock.remains,cycle_targets=1,if=!buff.primordial_wave.up" );
+    aoe->add_action( "elemental_blast,if=(!talent.elemental_spirits.enabled|(talent.elemental_spirits.enabled&(charges=max_charges|buff.feral_spirit.up)))&buff.maelstrom_weapon.stack=buff.maelstrom_weapon.max_stack&(!talent.crashing_storms.enabled|active_enemies<=3)" );
     aoe->add_action( "windstrike,if=talent.thorims_invocation.enabled&ti_chain_lightning&buff.maelstrom_weapon.stack>1" );
-    aoe->add_action( "lava_lash,target_if=min:debuff.lashing_flames.remains,cycle_targets=1,if=talent.lashing_flames.enabled&dot.flame_shock.ticking&(active_dot.flame_shock<active_enemies)&active_dot.flame_shock<6" );
-    aoe->add_action( "lava_lash,if=talent.molten_assault.enabled&dot.flame_shock.ticking&(active_dot.flame_shock<active_enemies)&active_dot.flame_shock<6" );
-    aoe->add_action( "flame_shock,if=!ticking" );
-    aoe->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,cycle_targets=1,if=talent.fire_nova.enabled&(active_dot.flame_shock<active_enemies)&active_dot.flame_shock<6" );
-    aoe->add_action( "ice_strike,if=talent.hailstorm.enabled" );
+    aoe->add_action( "chain_lightning,if=buff.maelstrom_weapon.stack=buff.maelstrom_weapon.max_stack" );
+    aoe->add_action( "crash_lightning,if=buff.doom_winds.up|!buff.crash_lightning.up|(talent.alpha_wolf.enabled&feral_spirit.active&alpha_wolf_min_remains=0)" );
+    aoe->add_action( "sundering,if=buff.doom_winds.up|set_bonus.tier30_2pc" );
+    aoe->add_action( "fire_nova,if=active_dot.flame_shock=6|(active_dot.flame_shock>=4&active_dot.flame_shock=active_enemies)" );
+    aoe->add_action( "lava_lash,target_if=min:debuff.lashing_flames.remains,cycle_targets=1,if=talent.lashing_flames.enabled" );
+    aoe->add_action( "lava_lash,if=(talent.molten_assault.enabled&dot.flame_shock.ticking&(active_dot.flame_shock<active_enemies)&active_dot.flame_shock<6)|(talent.ashen_catalyst.enabled&buff.ashen_catalyst.stack=buff.ashen_catalyst.max_stack)");
+    aoe->add_action( "ice_strike,if=talent.hailstorm.enabled&!buff.ice_strike.up" );
     aoe->add_action( "frost_shock,if=talent.hailstorm.enabled&buff.hailstorm.up" );
     aoe->add_action( "sundering" );
-    aoe->add_action( "fire_nova,if=active_dot.flame_shock>=4" );
-    aoe->add_action( "lava_lash,target_if=min:debuff.lashing_flames.remains,cycle_targets=1,if=talent.lashing_flames.enabled" );
+    aoe->add_action( "flame_shock,if=talent.molten_assault.enabled&!ticking" );
+    aoe->add_action( "flame_shock,target_if=min:dot.flame_shock.remains,cycle_targets=1,if=(talent.fire_nova.enabled|talent.primordial_wave.enabled)&(active_dot.flame_shock<active_enemies)&active_dot.flame_shock<6" );
     aoe->add_action( "fire_nova,if=active_dot.flame_shock>=3" );
-    aoe->add_action( "elemental_blast,if=(!talent.elemental_spirits.enabled|(talent.elemental_spirits.enabled&(charges=max_charges|buff.feral_spirit.up)))&buff.maelstrom_weapon.stack=10&(!talent.crashing_storms.enabled|active_enemies<=3)" );
-    aoe->add_action( "chain_lightning,if=buff.maelstrom_weapon.stack=10" );
-    aoe->add_action( "crash_lightning,if=buff.cl_crash_lightning.up" );
-    aoe->add_action( "lava_lash,if=buff.crash_lightning.up&buff.ashen_catalyst.stack=8" );
-    aoe->add_action( "windstrike,if=buff.crash_lightning.up" );
-    aoe->add_action( "stormstrike,if=buff.crash_lightning.up&(buff.converging_storms.stack=6|(set_bonus.tier29_2pc&buff.maelstrom_of_elements.down&buff.maelstrom_weapon.stack<=5))" );
-    aoe->add_action( "lava_lash,if=buff.crash_lightning.up,if=talent.molten_assault.enabled" );
-    aoe->add_action( "ice_strike,if=buff.crash_lightning.up,if=talent.swirling_maelstrom.enabled" );
-    aoe->add_action( "stormstrike,if=buff.crash_lightning.up" );
-    aoe->add_action( "ice_strike,if=buff.crash_lightning.up" );
-    aoe->add_action( "lava_lash,if=buff.crash_lightning.up" );
-    aoe->add_action( "elemental_blast,if=(!talent.elemental_spirits.enabled|(talent.elemental_spirits.enabled&(charges=max_charges|buff.feral_spirit.up)))&buff.maelstrom_weapon.stack>=5&(!talent.crashing_storms.enabled|active_enemies<=3)" );
-    aoe->add_action( "fire_nova,if=active_dot.flame_shock>=2" );
-    aoe->add_action( "crash_lightning" );
+    aoe->add_action( "stormstrike,if=buff.crash_lightning.up&(talent.deeply_rooted_elements.enabled|buff.converging_storms.stack=6)" );
+    aoe->add_action( "crash_lightning,if=talent.crashing_storms.enabled&buff.cl_crash_lightning.up&active_enemies>=4" );
     aoe->add_action( "windstrike" );
-    aoe->add_action( "lava_lash,if=talent.molten_assault.enabled" );
-    aoe->add_action( "ice_strike,if=talent.swirling_maelstrom.enabled" );
     aoe->add_action( "stormstrike" );
     aoe->add_action( "ice_strike" );
     aoe->add_action( "lava_lash" );
-    aoe->add_action( "flame_shock,target_if=refreshable,cycle_targets=1" );
-    aoe->add_action( "frost_shock" );
+    aoe->add_action( "crash_lightning" );
+    aoe->add_action( "fire_nova,if=active_dot.flame_shock>=2" );
+    aoe->add_action( "elemental_blast,if=(!talent.elemental_spirits.enabled|(talent.elemental_spirits.enabled&(charges=max_charges|buff.feral_spirit.up)))&buff.maelstrom_weapon.stack>=5&(!talent.crashing_storms.enabled|active_enemies<=3)" );
     aoe->add_action( "chain_lightning,if=buff.maelstrom_weapon.stack>=5" );
-    aoe->add_action( "earth_elemental" );
     aoe->add_action( "windfury_totem,if=buff.windfury_totem.remains<30" );
+    aoe->add_action( "flame_shock,if=!ticking" );
+    aoe->add_action( "frost_shock,if=!talent.hailstorm.enabled" );
 
   // def->add_action( "call_action_list,name=opener" );
 }
@@ -11093,15 +11149,8 @@ double shaman_t::composite_player_multiplier( school_e school ) const
        ( dbc::is_school( school, SCHOOL_FROST ) || dbc::is_school( school, SCHOOL_FIRE ) ||
          dbc::is_school( school, SCHOOL_NATURE ) ) )
   {
-    if ( dbc->ptr )
-    {
-      unsigned n_imbues = ( main_hand_weapon.buff_type != 0 ) + ( off_hand_weapon.buff_type != 0 );
-      m *= 1.0 + talent.elemental_weapons->effectN( 1 ).percent() / 10.0 * n_imbues;
-    }
-    else
-    {
-      m *= 1.0 + talent.elemental_weapons->effectN( 1 ).percent();
-    }
+    unsigned n_imbues = ( main_hand_weapon.buff_type != 0 ) + ( off_hand_weapon.buff_type != 0 );
+    m *= 1.0 + talent.elemental_weapons->effectN( 1 ).percent() / 10.0 * n_imbues;
   }
 
   return m;
@@ -11185,11 +11234,14 @@ void shaman_t::reset()
   player_t::reset();
 
   lava_surge_during_lvb = false;
+  sk_during_cast          = false;
 
   lotfw_counter = 0U;
   dre_attempts = 0U;
   action.ti_trigger = nullptr;
   action.totemic_recall_totem = nullptr;
+
+  pet.all_wolves.clear();
 
   assert( active_flame_shock.empty() );
 }
@@ -11205,7 +11257,8 @@ void shaman_t::arise()
   {
     last_t30_proc = timespan_t::min();
     t30_proc_possible = false;
-    buff.t30_2pc_ele_driver->trigger();
+    make_event( sim, timespan_t::from_seconds( rng().range( 0, 5 ) ),
+                [ this ]() { buff.t30_2pc_ele_driver->trigger(); } );
   }
 }
 
@@ -11222,7 +11275,7 @@ void shaman_t::merge( player_t& other )
     mw_source_list.resize( s.mw_source_list.size() );
   }
 
-  for ( auto i = 0U; i < mw_source_list.size(); ++i )
+  for ( auto i = 0U; i < s.mw_source_list.size(); ++i )
   {
     mw_source_list[ i ].first.merge( s.mw_source_list[ i ].first );
     mw_source_list[ i ].second.merge( s.mw_source_list[ i ].second );
@@ -11233,14 +11286,18 @@ void shaman_t::merge( player_t& other )
     mw_spend_list.resize( s.mw_spend_list.size() );
   }
 
-  for ( auto i = 0U; i < mw_spend_list.size(); ++i )
+  for ( auto i = 0U; i < s.mw_spend_list.size(); ++i )
   {
-    mw_spend_list[ i ].merge( s.mw_spend_list[ i ] );
+    for ( auto j = 0U; j < s.mw_spend_list[ i ].size(); ++j )
+    {
+      mw_spend_list[ i ][ j ].merge( s.mw_spend_list[ i ][ j ] );
+    }
   }
 
   if ( talent.deeply_rooted_elements.ok() )
   {
     dre_samples.merge( s.dre_samples );
+    dre_uptime_samples.merge( s.dre_uptime_samples );
   }
 }
 
@@ -11311,12 +11368,99 @@ public:
   shaman_report_t( shaman_t& player ) : p( player )
   { }
 
+  void mw_consumer_stack_header( report::sc_html_stream& os )
+  {
+    auto columns = std::max( p.buff.maelstrom_weapon->data().max_stacks(),
+      as<unsigned>( p.talent.overflowing_maelstrom->effectN( 1 ).base_value() ) ) + 1;
+
+    os << "<table class=\"sc sort\" style=\"float: left;margin-right: 10px;\">\n"
+       << "<thead>\n"
+       << "<tr>\n";
+    os << fmt::format( "<th colspan=\"{}\"><strong>Casts per Maelstrom Weapon Stack Consumed</strong></th>\n", columns + 1 )
+       << "</tr>\n"
+       << "<th class=\"toggle-sort\" data-sortdir=\"asc\" data-sorttype=\"alpha\">Ability</th>\n";
+    for ( auto col = 0U; col < columns; ++col )
+    {
+       os << fmt::format( "<th>{}</th>\n", col );
+    }
+    os << "</tr>\n"
+       << "</thead>\n";
+  }
+
+  void mw_consumer_stack_contents( report::sc_html_stream& os )
+  {
+    auto columns = std::max( p.buff.maelstrom_weapon->data().max_stacks(),
+      as<unsigned>( p.talent.overflowing_maelstrom->effectN( 1 ).base_value() ) ) + 1;
+
+    int row = 0;
+    std::vector<double> row_totals( columns, 0.0 );
+
+    for ( auto i = 0; i < as<int>( p.mw_spend_list.size() ); ++i )
+    {
+      const auto& ref = p.mw_spend_list[ i ];
+
+      auto action_sum = range::accumulate( ref, 0.0, &simple_sample_data_t::sum ) - ref[ 0 ].sum();
+      if ( action_sum == 0.0 )
+      {
+        continue;
+      }
+
+      auto action = range::find_if( p.action_list, [ i ]( const action_t* action ) {
+        return action->internal_id == i;
+      } );
+
+      os << fmt::format( "<tr class=\"{}\">\n", row++ & 1 ? "odd" : "even" );
+      os << fmt::format( "<td class=\"left\">{}</td>", report_decorators::decorated_action( **action ) );
+
+      for ( auto col = 0; col < as<int>( columns ); ++col )
+      {
+        auto casts = ref[ col ].sum() / ( col > 1 ? as<double>( col ) : 1.0 );
+
+        if ( ref[ col ].sum() == 0.0 )
+        {
+          os << "<td class=\"left\" style=\"min-width: 5ch;\">&nbsp;</td>\n";
+        }
+        else
+        {
+          os << fmt::format( "<td class=\"left\" style=\"min-width: 5ch;\">{:.2f}</td>\n", casts );
+        }
+
+        row_totals[ col ] += casts;
+      }
+
+      os << "</tr>\n";
+    }
+
+    os << fmt::format( "<tr class=\"{}\">\n", row++ & 1 ? "odd" : "even" )
+       << "<td class=\"left\"><strong>Total</strong>\n";
+
+    auto total_sum = range::accumulate( row_totals, 0.0 );
+    range::for_each( row_totals, [ &os, total_sum ]( auto row_sum ) {
+      if ( row_sum == 0.0 )
+      {
+        os << "<td class=\"left\" style=\"min-width: 5ch;\">&nbsp;</td>\n";
+      }
+      else
+      {
+        os << fmt::format( "<td class=\"left\" style=\"min-width: 5ch;\"><strong>{:.2f}</strong><br/>({:.2f}%)</td>\n",
+          row_sum, 100 * row_sum / total_sum );
+      }
+    } );
+
+    os << "</tr>\n";
+  }
+
+  void mw_consumer_stack_footer( report::sc_html_stream& os )
+  {
+    os << "</table>\n";
+  }
+
   void mw_consumer_header( report::sc_html_stream& os )
   {
     os << "<table class=\"sc sort\" style=\"float: left;margin-right: 10px;\">\n"
        << "<thead>\n"
        << "<tr>\n"
-       << "<th colspan=\"5\"><strong>Maelstrom Weapon Consumers</strong></th>\n"
+       << "<th colspan=\"3\"><strong>Maelstrom Weapon Consumers</strong></th>\n"
        << "</tr>\n"
        << "<tr>\n"
        << "<th class=\"toggle-sort\" data-sortdir=\"asc\" data-sorttype=\"alpha\">Ability</th>\n"
@@ -11332,27 +11476,28 @@ public:
       double total = 0.0;
 
       range::for_each( p.mw_spend_list,  [ &total ]( const auto& entry ) {
-        total += entry.sum();
+        total = range::accumulate( entry, total, &simple_sample_data_t::sum ) - entry[ 0 ].sum();
       } );
 
       for ( auto i = 0; i < as<int>( p.mw_spend_list.size() ); ++i )
       {
         const auto& ref = p.mw_spend_list[ i ];
 
-        if ( ref.sum() == 0.0 )
-        {
-          continue;
-        }
-
         auto action = range::find_if( p.action_list, [ i ]( const action_t* action ) {
           return action->internal_id == i;
         } );
 
+        auto action_sum = range::accumulate( ref, 0.0, &simple_sample_data_t::sum ) - ref[ 0 ].sum();
+
+        if ( action_sum == 0.0 )
+        {
+          continue;
+        }
+
         os << fmt::format( "<tr class=\"{}\">\n", row++ & 1 ? "odd" : "even" );
         os << fmt::format( "<td class=\"left\">{}</td>", report_decorators::decorated_action( **action ) );
-        os << fmt::format( "<td class=\"left\">{:.1f}</td>", ref.sum() );
-        os << fmt::format( "<td class=\"left\">{:.2f}%</td>",
-                          100.0 * ref.sum() / total );
+        os << fmt::format( "<td class=\"left\">{:.1f}</td>", action_sum );
+        os << fmt::format( "<td class=\"left\">{:.2f}%</td>", 100.0 * action_sum / total );
         os << "</tr>\n";
       }
 
@@ -11374,7 +11519,8 @@ public:
     {
       const auto& entry = p.mw_spend_list[ i ];
 
-      if ( entry.sum() == 0.0 )
+      auto sum = range::accumulate( entry, 0.0, &simple_sample_data_t::sum ) - entry[ 0 ].sum();
+      if ( sum == 0.0 )
       {
         continue;
       }
@@ -11383,7 +11529,7 @@ public:
         return action->internal_id == as<int>( i );
       } );
 
-      processed_data.emplace_back( *action_it, entry.sum() );
+      processed_data.emplace_back( *action_it, sum );
     }
 
     range::sort( processed_data, []( const auto& left, const auto& right ) {
@@ -11548,12 +11694,38 @@ public:
     os << "</table>\n";
   }
 
-  void dre_distribution_contents( report::sc_html_stream& os )
+  void dre_uptime_distribution_contents( report::sc_html_stream& os )
+  {
+    highchart::histogram_chart_t chart( highchart::build_id( p, "dre_uptime" ), *p.sim );
+
+    chart.set( "plotOptions.column.color", color::GREY3.str() );
+    chart.set( "plotOptions.column.pointStart", std::floor( p.dre_uptime_samples.min() ) );
+    chart.set_title( fmt::format( "DRE Iteration Uptime% (min={:.2f}% median={:.2f}% max={:.2f}%)",
+                                 p.dre_uptime_samples.min(),
+                                 p.dre_uptime_samples.percentile( 0.5 ),
+                                 p.dre_uptime_samples.max() ) );
+    chart.set( "yAxis.title.text", "# of Iterations" );
+    chart.set( "xAxis.title.text", "Uptime%" );
+    chart.set( "series.0.name", "# of Iterations" );
+
+    range::for_each( p.dre_uptime_samples.distribution, [ &chart ]( size_t n ) {
+      js::sc_js_t e;
+
+      e.set( "y", static_cast<double>( n ) );
+
+      chart.add( "series.0.data", e );
+    } );
+
+    os << chart.to_target_div();
+    p.sim->add_chart_data( chart );
+  }
+
+  void dre_proc_distribution_contents( report::sc_html_stream& os )
   {
     highchart::histogram_chart_t chart( highchart::build_id( p, "dre" ), *p.sim );
 
     chart.set( "plotOptions.column.color", color::RED.str() );
-    chart.set( "plotOptions.column.pointStart", p.dbc->ptr ? 3 : 1 );
+    chart.set( "plotOptions.column.pointStart", p.options.dre_forced_failures + 1 );
     chart.set_title( fmt::format( "DRE Attempts (min={} median={} max={})", p.dre_samples.min(),
                                  p.dre_samples.percentile( 0.5 ), p.dre_samples.max() ) );
     chart.set( "yAxis.title.text", "# of Triggered Procs" );
@@ -11590,8 +11762,15 @@ public:
 
       mw_consumer_header( os );
       mw_consumer_contents( os );
-      mw_consumer_piechart_contents( os );
       mw_consumer_footer( os );
+
+      mw_consumer_stack_header( os );
+      mw_consumer_stack_contents( os );
+      mw_consumer_stack_footer( os );
+
+      os << "<div class=\"clear\"></div>\n";
+
+      mw_consumer_piechart_contents( os );
 
       os << "\t\t\t\t\t</div>\n";
 
@@ -11606,7 +11785,8 @@ public:
       os << "\t\t\t\t\t<h3 class=\"toggle open\">Deeply Rooted Elements Proc Details</h3>\n"
          << "\t\t\t\t\t<div class=\"toggle-content\">\n";
 
-      dre_distribution_contents( os );
+      dre_proc_distribution_contents( os );
+      dre_uptime_distribution_contents( os );
 
       os << "\t\t\t\t\t</div>\n";
 
@@ -11676,6 +11856,35 @@ shaman_t::pets_t::pets_t( shaman_t* s )
   fire_wolves.set_replacement_strategy( spawner::pet_replacement_strategy::REPLACE_OLDEST );
   frost_wolves.set_replacement_strategy( spawner::pet_replacement_strategy::REPLACE_OLDEST );
   lightning_wolves.set_replacement_strategy( spawner::pet_replacement_strategy::REPLACE_OLDEST );
+
+  auto event_fn = [ s ]( spawner::pet_event_type t, pet::base_wolf_t* pet ) {
+    auto it = range::find_if( s->pet.all_wolves, [ pet ]( const auto entry ) {
+      return pet == entry;
+    } );
+
+    switch ( t )
+    {
+      case spawner::pet_event_type::ARISE:
+      {
+        assert( it == s->pet.all_wolves.end() );
+        s->pet.all_wolves.emplace_back( pet );
+        break;
+      }
+      case spawner::pet_event_type::DEMISE:
+      {
+        assert( it != s->pet.all_wolves.end() );
+        s->pet.all_wolves.erase( it );
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  spirit_wolves.set_event_callback( { spawner::pet_event_type::ARISE, spawner::pet_event_type::DEMISE }, event_fn );
+  fire_wolves.set_event_callback( { spawner::pet_event_type::ARISE, spawner::pet_event_type::DEMISE }, event_fn );
+  frost_wolves.set_event_callback( { spawner::pet_event_type::ARISE, spawner::pet_event_type::DEMISE }, event_fn );
+  lightning_wolves.set_event_callback( { spawner::pet_event_type::ARISE, spawner::pet_event_type::DEMISE }, event_fn );
 }
 
 }  // namespace
